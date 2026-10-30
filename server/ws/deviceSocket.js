@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { resolveWithin } = require('../lib/safe-path');
+const { isRtspsUrl } = require('../lib/remote-url');
 const { db, pruneTelemetry, pruneScreenshots } = require('../db/database');
 const { effectiveDeviceTz } = require('../lib/device-timezone');
 const config = require('../config');
@@ -37,6 +38,7 @@ const logCoalescer = require('../lib/log-coalescer');
 const loopLag = require('../services/loop-lag');
 const incidentClassify = require('../lib/incident-classify'); // offline-cause log: disconnect-reason + connectivity classification
 const pluginHooks = require('../lib/plugins/hooks');
+const { playerBrandForDevice } = require('../lib/branding'); // #674: device:paired carries the workspace brand
 const playerTermination = require('../lib/mesh/player-termination'); // scale-out C2: players on a replica
 
 // Debounce window for marking a device offline on socket disconnect. Brief
@@ -289,7 +291,7 @@ function applyDeviceInfo(deviceId, di) {
   } catch (_) { /* incident feed is best-effort */ }
   db.prepare(`UPDATE devices SET android_version = ?, app_version = ?, screen_width = ?, screen_height = ?, render_width = ?, render_height = ?,
     ota_status = ?, ota_target_version = ?, ota_attempts = ?, tier = ?, foreign_device_owner = ?,
-    can_write_settings = ?, accessibility_enabled = ?, overlay_granted = ?, capture_mode = ?,
+    can_write_settings = ?, accessibility_enabled = ?, overlay_granted = ?, capture_mode = ?, wifi_mode = ?,
     media_volume = ?, system_brightness = ?, window_brightness = ?, screen_off_timeout_ms = ?, ota_updated_at = strftime('%s','now') WHERE id = ?`)
     .run(di.android_version, di.app_version, px(di.screen_width), px(di.screen_height), px(di.render_width), px(di.render_height),
       di.ota_status ?? 'none', di.ota_target_version ?? null, di.ota_attempts ?? 0,
@@ -297,6 +299,8 @@ function applyDeviceInfo(deviceId, di) {
       di.can_write_settings ? 1 : 0, di.accessibility_enabled ? 1 : 0, di.overlay_granted ? 1 : 0,
       // Absent (older build, non-Android player) must stay NULL rather than become a bogus tier.
       ['projection', 'accessibility', 'view', 'none'].includes(di.capture_mode) ? di.capture_mode : null,
+      // #720: same rule — an older player has no wifi_mode and must stay NULL (lib/device-wifi.js).
+      require('../lib/device-wifi').cleanMode(di.wifi_mode),
       num(di.media_volume), num(di.system_brightness), num(di.window_brightness), num(di.screen_off_timeout_ms),
       deviceId);
 }
@@ -559,7 +563,16 @@ function refreshWidgetRevs(assignments, deviceId = null) {
         const tok = require('../lib/rooms/service').panelToken(a.widget_id, panelDevice);
         if (tok) a.widget_panel = tok;
       }
-      const rev = facts.rev ?? a.widget_rev ?? 0;
+      // + the render epoch (lib/widget-render-epoch.js): a fix to a widget's page reaches screens that cached it.
+      let rev = Number(facts.rev ?? a.widget_rev ?? 0) + require('../lib/widget-render-epoch');
+      // A widget following its screen renders differently per place, and its page is cached by URL:
+      // the place goes into the rev, so moving the screen reloads it and nothing else does.
+      if (deviceId) {
+        const wl = require('../lib/widget-location');
+        let cfg = {};
+        try { cfg = JSON.parse(facts.config || '{}'); } catch (_) {}
+        if (wl.followsScreen(facts.widget_type, cfg)) rev = Number(rev) + wl.revSalt(facts.widget_type, cfg, wl.screenPlace(db, deviceId, facts.workspace_id));
+      }
       a.widget_rev = rev;
       // A cloud document is framed same-origin too: Google's embed breaks in an opaque origin, and its
       // render document runs no script at all (lib/cloud-docs.js, enforced by its CSP).
@@ -598,7 +611,7 @@ function refreshWidgetRevs(assignments, deviceId = null) {
  */
 const contentFactsOf = db.prepare(`
   SELECT COALESCE(NULLIF(updated_at, 0), created_at) AS rev, filepath, mime_type, file_size, bundle_entry,
-         width, height, video_prerotated
+         width, height, video_prerotated, fisheye
     FROM content WHERE id = ?
 `);
 function refreshContentRevs(assignments) {
@@ -628,6 +641,12 @@ function refreshContentRevs(assignments) {
        * at send time, so neither needs a republish. */
       if (row.width > 0 && row.height > 0) { a.width = row.width; a.height = row.height; }
       if (Number(row.video_prerotated) === 1) a.video_prerotated = 1; else delete a.video_prerotated;
+      /* A fisheye camera's view settings (lib/fisheye.js), read at send time like the flag above, so
+       * "Save" in the camera's Edit dialog moves every screen showing it without a republish. The row
+       * is the approved state: an approval workspace keeps the edit as a draft until it is released. */
+      const fisheye = row.fisheye && require('../lib/remote-url').LIVE_MIMES.includes(a.mime_type)
+        ? require('../lib/fisheye').normalize(row.fisheye) : null;
+      if (fisheye) a.fisheye = fisheye; else delete a.fisheye;
     } catch (_) { /* keep published */ }
   }
 }
@@ -758,6 +777,9 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
    */
   const deviceSupportsHls = capsLib.supports(device, 'playback.hls');
   const deviceSupportsRtsp = capsLib.supports(device, 'playback.rtsp');
+  // rtsps:// (RTSP over TLS) is still video/rtsp, but a player that only declares playback.rtsp
+  // (3.0.1 and earlier) would open it as plain RTSP and fail, so it needs playback.rtsps too.
+  const deviceSupportsRtsps = deviceSupportsRtsp && capsLib.supports(device, 'playback.rtsps');
   // HDMI IN (video/hdmi-in): only a player that found an input on THIS device declares it.
   const deviceSupportsHdmiIn = capsLib.supports(device, 'playback.hdmi_in');
   // A hold (lib/hold-item.js) is not live, but it rides the same strip for the same reason: a player
@@ -765,12 +787,12 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
   const deviceSupportsHold = capsLib.supports(device, 'playback.hold');
   // `sink` (preview trace only) collects what was left out; the base playlist passes it, triggers don't.
   const dropLiveIfUnsupported = (items, sink = null) => {
-    if (!Array.isArray(items) || (deviceSupportsHls && deviceSupportsRtsp && deviceSupportsHdmiIn && deviceSupportsHold)) return items;
+    if (!Array.isArray(items) || (deviceSupportsHls && deviceSupportsRtsps && deviceSupportsHdmiIn && deviceSupportsHold)) return items;
     return items.filter((a) => {
       if (!a) return true;
       let keep = true;
       if (a.mime_type === 'video/hls') keep = deviceSupportsHls;
-      else if (a.mime_type === 'video/rtsp') keep = deviceSupportsRtsp;
+      else if (a.mime_type === 'video/rtsp') keep = isRtspsUrl(a.remote_url) ? deviceSupportsRtsps : deviceSupportsRtsp;
       else if (a.mime_type === 'video/hdmi-in') keep = deviceSupportsHdmiIn;
       else if (a.mime_type === 'application/x-st-hold') keep = deviceSupportsHold;
       if (!keep && sink) sink.push(a);
@@ -781,6 +803,8 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
 
   let assignments = [];
   let playback_order = 'sequential';
+  // #660: the playlist whose own background colour (if any) this screen paints, in place of its own.
+  let bgPlaylistId = null;
   let campaignRaw = null;
   /*
    * ⚠️ CORPORATE: a head office mandate drives this screen (source 'corporate', with or without a
@@ -849,6 +873,7 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
     refreshContentRevs(assignments);
     assignments = dropLiveIfUnsupported(assignments);
     playback_order = (pl && pl.published_playback_order) || 'sequential';
+    bgPlaylistId = t.target_ref;
   } else if (capNow) {
     const feed = capNow.feed;
     const pl = feed.playlist_id
@@ -863,6 +888,7 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
       playback_order = 'sequential';
     } else {
       playback_order = (pl && pl.published_playback_order) || 'sequential';
+      bgPlaylistId = feed.playlist_id;
     }
     for (const a of items) if (a && typeof a === 'object') a.__origin_ws = feed.workspace_id;
     assignments = items;
@@ -873,10 +899,12 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
     assignments = hookNow.items;
     for (const a of assignments) if (a && typeof a === 'object') a.__origin_ws = hookNow.override.workspace_id;
     playback_order = hookNow.playback_order;
+    bgPlaylistId = hookNow.override.playlist_id;
     refreshWidgetRevs(assignments, deviceId);
     refreshContentRevs(assignments);
     assignments = dropLiveIfUnsupported(assignments);
   } else if (corporateSource && device?.playlist_id) {
+    bgPlaylistId = device.playlist_id;
     try {
       const c = require('../lib/corporate/composition').compositionFor(db, deviceId, device.playlist_id);
       assignments = c.items;
@@ -894,6 +922,7 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
     refreshContentRevs(assignments);   // re-stamps a.mime_type, so strip live AFTER it
     assignments = dropLiveIfUnsupported(assignments, baseSink);
   } else if (device?.playlist_id) {
+    bgPlaylistId = device.playlist_id;
     const playlist = db.prepare('SELECT published_snapshot, published_playback_order, workspace_id FROM playlists WHERE id = ?').get(device.playlist_id);
     // 3.0 campaigns (lib/campaign.js): the stored structure, read only for a player that can use it.
     if (playlist && capsLib.supports(device, 'layout.campaign')) {
@@ -1184,7 +1213,12 @@ function buildPlaylistPayloadUnchecked(deviceId, opts = {}) {
   // Weather and area conditions are decided here, for this screen (lib/local-conditions.js).
   if (trace) trace.before_local = assignments;
   assignments = require('../lib/local-conditions').filterItems(assignments, device, opts.weather || undefined);
-  const assembled = assemblePayload({ assignments, layout, orientation: device?.orientation || 'landscape', background_color: device?.background_color || null, workspace_id: device?.workspace_id || null, wall_config, group_sync, timezone, triggers, trigger_config, local_api, playback_order, default_content, power_schedule, endpoints: deviceEndpoints });
+  // #660: a playlist's published colour wins over the device's while that playlist plays.
+  let playlistBg = null;
+  if (bgPlaylistId && require('../lib/corporate/schema-probe').hasColumn(db, 'playlists', 'published_background_color')) {
+    playlistBg = (db.prepare('SELECT published_background_color FROM playlists WHERE id = ?').get(bgPlaylistId) || {}).published_background_color || null;
+  }
+  const assembled = assemblePayload({ assignments, layout, orientation: device?.orientation || 'landscape', background_color: playlistBg || device?.background_color || null, workspace_id: device?.workspace_id || null, wall_config, group_sync, timezone, triggers, trigger_config, local_api, playback_order, default_content, power_schedule, endpoints: deviceEndpoints });
   /*
    * Audience counting (lib/audience.js). Top-level and outside the item list, so switching it on or
    * off never restarts playback (#234). Rides EVERY payload, and null means OFF — so a screen that
@@ -1717,6 +1751,27 @@ const EVENT_APPLIERS = Object.freeze({
     }
   },
 
+  /*
+   * The web player's offline-cache report (player index.html reportOfflineCache): how many of its
+   * media files would play with the network gone, the bytes, its storage quota and the last error
+   * that stopped the cache filling. Numbers and one short error name only, nothing free-form.
+   */
+  'cache-status'(deviceId, data, ctx) {
+    if (!data || (data.device_id && data.device_id !== deviceId)) return;
+    if (!deviceExists(deviceId)) return;
+    const n = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 && v !== null && v !== '' ? Math.floor(Number(v)) : null);
+    const report = {
+      wanted: n(data.wanted), ready: n(data.ready), ready_bytes: n(data.ready_bytes),
+      partial: n(data.partial), partial_bytes: n(data.partial_bytes), usage: n(data.usage), quota: n(data.quota),
+      persisted: typeof data.persisted === 'boolean' ? data.persisted : null,
+      error: typeof data.error === 'string' && /^[A-Za-z]{1,40}$/.test(data.error) ? data.error : null,
+    };
+    try {
+      db.prepare('UPDATE devices SET offline_cache = ?, offline_cache_at = ? WHERE id = ?')
+        .run(JSON.stringify(report), Math.floor(Date.now() / 1000), deviceId);
+    } catch (e) { console.warn(`[cache] could not store the offline-cache report for ${deviceId}: ${e && e.message}`); }
+  },
+
   'heartbeat'(deviceId, data, ctx) {
     const { device_id, telemetry } = data || {};
     // The heartbeat ACK is sent by the socket handler, before authentication (see below).
@@ -1748,6 +1803,21 @@ const EVENT_APPLIERS = Object.freeze({
     // Optional panel state (power / input) for screen verification; no column of its own here.
     if (telemetry && telemetry.panel) { try { screenVerify.notePanelReport(device_id, telemetry.panel); } catch (_) { /* best effort */ } }
     if (telemetry && deviceExists(device_id)) {
+      // #724: the per-device "mains powered, ignore battery" override forces battery readings to
+      // blank for boards that report a fake battery as present. The player's EXTRA_PRESENT check
+      // handles honest mains boards; this covers the ones that lie about presence, and does it
+      // server-side so it holds for every player version. The "no battery" signal the dashboard and
+      // alerts key on is battery_level being null; battery_charging stays 0 in that case because the
+      // device_telemetry.battery_charging column is NOT NULL (it has always stored 0 for a
+      // batteryless/mains device — every web player sends battery_charging:null and relied on this).
+      // Writing null here instead threw a NOT NULL constraint, which the safe-socket wrapper above
+      // reads as a broken handler and disconnects the panel over — so keep it 0.
+      const battRow = db.prepare('SELECT ignore_battery FROM devices WHERE id = ?').get(device_id);
+      const ignoreBatt = !!(battRow && battRow.ignore_battery);
+      const battLevel = ignoreBatt ? null : (telemetry.battery_level ?? null);
+      const battCharging = (ignoreBatt || telemetry.battery_charging == null)
+        ? 0
+        : (telemetry.battery_charging ? 1 : 0);
       db.prepare(`
         INSERT INTO device_telemetry (device_id, battery_level, battery_charging, storage_free_mb, storage_total_mb,
           ram_free_mb, ram_total_mb, cpu_usage, wifi_rssi, uptime_seconds, local_ip, local_ip6, temperature_c,
@@ -1755,8 +1825,8 @@ const EVENT_APPLIERS = Object.freeze({
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         device_id,
-        telemetry.battery_level ?? null,
-        telemetry.battery_charging ? 1 : 0,
+        battLevel,
+        battCharging,
         telemetry.storage_free_mb ?? null,
         telemetry.storage_total_mb ?? null,
         telemetry.ram_free_mb ?? null,
@@ -1906,6 +1976,17 @@ const EVENT_APPLIERS = Object.freeze({
       .run(ota_status ?? 'none', ota_target_version ?? null, ota_attempts ?? 0, device_id);
   },
 
+  /*
+   * #720: what the player did with each network of its managed Wi-Fi list (applied / suggested /
+   * deferred / failed / unsupported, plus a short reason code). A report like any other, so a
+   * replica may relay it; lib/device-wifi.js applyResult() only touches rows of THIS device and
+   * keeps nothing outside its vocabulary. There is never a password in it.
+   */
+  'wifi-result'(deviceId, data, ctx) {
+    if (data && data.device_id && data.device_id !== deviceId) return;
+    try { require('../lib/device-wifi').applyResult(deviceId, data); } catch (e) { console.warn(`[wifi] result from ${deviceId}: ${e.message}`); }
+    emitToDeviceWorkspace(_dashboardNsRef, deviceId, 'dashboard:wifi-result', { device_id: deviceId });
+  },
   /*
    * The screen unpaired ITSELF — an operator pressed Esc at the panel and entered the settings PIN.
    *
@@ -3010,7 +3091,8 @@ module.exports = function setupDeviceSocket(io) {
                   socket.emit('device:paired', {
                     device_id: oldDevice.id,
                     name: oldDevice.name || 'Display',
-                    settings_pin: oldDevice.settings_pin || undefined
+                    settings_pin: oldDevice.settings_pin || undefined,
+                    brand: playerBrandForDevice(db, oldDevice.id)   // #674
                   });
                 }
                 currentDeviceId = existing.device_id;
@@ -3238,11 +3320,15 @@ module.exports = function setupDeviceSocket(io) {
           // — never received it and sat on the Connect page forever showing the URL (Bold #143).
           // Re-send the exact event the client already listens for; no client change needed.
           if (device.user_id) {
-            socket.emit('device:paired', { device_id, name: device.name || 'Display', settings_pin: device.settings_pin || undefined });
+            socket.emit('device:paired', { device_id, name: device.name || 'Display', settings_pin: device.settings_pin || undefined, brand: playerBrandForDevice(db, device_id) });
           }
           logDeviceStatus(device_id, 'online');
           // Flush any commands/playlist-updates queued while this device was offline.
           commandQueue.flushQueue(deviceNs, device_id, buildPlaylistPayload);
+          // #720: the screen's managed Wi-Fi list, every connect (a change made while it was offline
+          // lands here). Only on this, the direct path: a replica holds no rows and must never send
+          // an empty list (lib/device-wifi.js). push() itself checks the capability and the TLS gate.
+          try { require('../lib/device-wifi').push(io, device_id); } catch (e) { console.warn(`[wifi] connect push for ${device_id} failed: ${e.message}`); }
 
           // If this device is part of a wall, re-evaluate leadership.
           // Preferred leader = online member with smallest (canvas_x +
@@ -3478,6 +3564,8 @@ module.exports = function setupDeviceSocket(io) {
     });
 
     socket.on('device:trigger-status', (data) => dispatch('trigger-status', data));
+    socket.on('device:cache-status', (data) => dispatch('cache-status', data));
+    socket.on('device:wifi-result', (data) => dispatch('wifi-result', data));
 
     socket.on('device:heartbeat', (data) => {
       const { device_id } = data || {};
@@ -3492,6 +3580,16 @@ module.exports = function setupDeviceSocket(io) {
     socket.on('device:screenshot', (data) => dispatch('screenshot', data));
 
     socket.on('device:http-result', (data) => dispatch('http-result', data));
+
+    /*
+     * The answer to an ONVIF relay request (lib/onvif/relay.js). Not through dispatch(): nothing is
+     * applied or forwarded, it resolves the request THIS process is waiting on, and handleResult
+     * ignores it unless it answers a request made to this very screen.
+     */
+    socket.on('device:onvif-result', (data) => {
+      if (!requireDeviceAuth()) return;
+      require('../lib/onvif/relay').handleResult(currentDeviceId, data);
+    });
 
     socket.on('device:shell-result', (data) => dispatch('shell-result', data));
 

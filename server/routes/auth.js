@@ -6,6 +6,7 @@ const { db } = require('../db/database');
 const { generateToken, bumpTokenVersion, generateMfaPendingToken, verifyMfaPendingToken, requireAuth, requireAdmin, requireSuperAdmin, isPlatformRole, isPlatformStaff, PLATFORM_ROLES } = require('../middleware/auth');
 const { resolveTenancy } = require('../lib/tenancy');
 const { logActivity, getClientIp } = require('../services/activity');
+const { authenticationFailure, AUTH_METHOD } = require('../lib/http-logging');
 const totp = require('../lib/totp');
 const totpLockout = require('../lib/totp-lockout');
 const loginLockout = require('../lib/login-lockout');
@@ -67,7 +68,10 @@ function ensureDefaultOrgForUser(user, { allowCreate = true } = {}) {
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-function logFailedLogin(email, ip, reason) {
+function logFailedLogin(email, ip, reason, method = null) {
+  // Pass a method for password/TOTP failures that should count toward a ban.
+  // Other refusals stay in the audit log; do not decide this from the reason text.
+  if (method) authenticationFailure(ip, method);
   try {
     db.prepare('INSERT INTO activity_log (user_id, action, details, ip_address) VALUES (NULL, ?, ?, ?)')
       .run('auth:login_failed', `${email} - ${reason}`, ip);
@@ -352,7 +356,7 @@ router.post('/login', (req, res) => {
   if (!user) {
     // An unknown address at an enforced domain answers exactly like a known one — see above.
     if (domainEnforced) return ssoRefusal();
-    logFailedLogin(email, getClientIp(req), 'User not found');
+    logFailedLogin(email, getClientIp(req), 'User not found', AUTH_METHOD.PASSWORD);
     return res.status(401).json({ error: 'Invalid email or password' });
   }
   // The break-glass: the operator may still sign in with a password at an enforced domain, but a
@@ -419,7 +423,7 @@ router.post('/login', (req, res) => {
   // guessing straight through it and stop on the changed answer: the lock would stop nothing.
   if (loginLockout.isLocked(user.id)) {
     loginLockout.warnLocked(user.id, `${email} (user ${user.id})`);
-    logFailedLogin(email, getClientIp(req), 'Locked out (too many failed passwords)');
+    logFailedLogin(email, getClientIp(req), 'Locked out (too many failed passwords)', AUTH_METHOD.PASSWORD);
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
@@ -447,7 +451,7 @@ router.post('/login', (req, res) => {
       logActivity(null, 'auth:login_locked', `${email} - locked after repeated failures`, null, getClientIp(req));
       loginLockout.warnLocked(user.id, `${email} (user ${user.id})`);
     }
-    logFailedLogin(email, getClientIp(req), 'Wrong password');
+    logFailedLogin(email, getClientIp(req), 'Wrong password', AUTH_METHOD.PASSWORD);
     return res.status(401).json({ error: 'Invalid email or password' });
   }
 
@@ -815,7 +819,7 @@ router.post('/totp/verify', (req, res) => {
     viaRecovery = true;
   } else {
     totpLockout.recordFailure(decoded.id);
-    logFailedLogin(user.email, getClientIp(req), 'Bad TOTP/recovery code');
+    logFailedLogin(user.email, getClientIp(req), 'Bad TOTP/recovery code', AUTH_METHOD.TOTP);
     return res.status(401).json({ error: 'Invalid code' });
   }
   totpLockout.reset(decoded.id);
@@ -928,7 +932,11 @@ router.get('/me', requireAuth, resolveTenancy, (req, res) => {
   }
 
   const currentOrg = req.organizationId
-    ? db.prepare('SELECT id, name, COALESCE(widget_sandbox_isolation_disabled, 0) AS widget_sandbox_isolation_disabled FROM organizations WHERE id = ?').get(req.organizationId)
+    // owner_plan_id: plans belong to the person who pays, the org owner. A workspace admin invited
+    // into an Enterprise organization has a plan of their own (often free), so a check on their
+    // plan alone hid Enterprise features such as white-label branding from them.
+    ? db.prepare(`SELECT o.id, o.name, COALESCE(o.widget_sandbox_isolation_disabled, 0) AS widget_sandbox_isolation_disabled, u.plan_id AS owner_plan_id
+        FROM organizations o LEFT JOIN users u ON u.id = o.owner_user_id WHERE o.id = ?`).get(req.organizationId)
     : null;
 
   res.json({
@@ -1399,6 +1407,10 @@ router.post('/accept-invite/:inviteId', requireAuth, (req, res) => {
         .run(ws.organization_id, req.user.id, orgRole, invite.invited_by);
     }
     db.prepare('DELETE FROM workspace_invites WHERE id = ?').run(invite.id);
+    // Joining someone's workspace is not a first run: the first-run guide walks you through pairing
+    // a first screen in a workspace of your OWN, which an invitee does not need (app.js
+    // maybeStartFirstRun). Same stamp as PUT /me { onboarded: true }; never cleared.
+    db.prepare("UPDATE users SET onboarded_at = COALESCE(onboarded_at, strftime('%s','now')) WHERE id = ?").run(req.user.id);
   });
   txn();
 

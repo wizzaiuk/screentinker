@@ -775,7 +775,7 @@ router.put('/:id', (req, res) => {
   const device = checkDeviceOwnership(req, res);
   if (!device) return;
 
-  const { name, notes, timezone, orientation, background_color, default_content_id, layout_id, ota_enabled, ota_beta, reboot_schedule, live_video_enabled, tags, screen_profile } = req.body;
+  const { name, notes, timezone, orientation, background_color, default_content_id, layout_id, ota_enabled, ota_beta, reboot_schedule, live_video_enabled, tags, screen_profile, ignore_battery } = req.body;
   // Where the screen is (lib/local-conditions.js). Both coordinates or neither; both null clears.
   let locUpdate = null;
   if (req.body.latitude !== undefined || req.body.longitude !== undefined || req.body.location_label !== undefined) {
@@ -855,6 +855,12 @@ router.put('/:id', (req, res) => {
   if (live_video_enabled !== undefined) {
     updates.push('live_video_enabled = ?'); values.push(live_video_enabled ? 1 : 0);
   }
+  // #724: "mains powered, ignore battery" override for boards that report a fake battery as present.
+  // Enforced server-side at telemetry ingest (deviceSocket.js), so it works regardless of player
+  // version. The honest mains boards are already handled by the player's EXTRA_PRESENT check.
+  if (ignore_battery !== undefined) {
+    updates.push('ignore_battery = ?'); values.push(ignore_battery ? 1 : 0);
+  }
   // #12 scheduled reboot: device-local "HH:MM" (null/'' clears -> off). Reset the
   // once-per-day guard on any change so a newly-set time can still fire later today.
   if (reboot_schedule !== undefined) {
@@ -870,6 +876,47 @@ router.put('/:id', (req, res) => {
   }
   if (normTags !== undefined) { updates.push('tags = ?'); values.push(JSON.stringify(normTags)); }
   if (locUpdate) for (const [k, v] of Object.entries(locUpdate)) { updates.push(`${k} = ?`); values.push(v); }
+  if (device.client_type === 'embedded') {
+    let existingProfileObj = {};
+    try {
+      if (typeof device.screen_profile === 'string' && device.screen_profile.trim().startsWith('{')) {
+        existingProfileObj = JSON.parse(device.screen_profile);
+      } else if (typeof device.screen_profile === 'object' && device.screen_profile) {
+        existingProfileObj = { ...device.screen_profile };
+      } else if (typeof device.screen_profile === 'string' && device.screen_profile) {
+        existingProfileObj = { preset: device.screen_profile };
+      }
+    } catch (_) {}
+
+    const currentEffectiveOrient = existingProfileObj.orientation
+      || device.reported_orientation
+      || device.orientation
+      || 'landscape';
+    const orientationActuallyChanged = orientation !== undefined && orientation !== currentEffectiveOrient;
+
+    if (orientationActuallyChanged) {
+      updates.push('reported_orientation = ?');
+      values.push(null);
+    }
+
+    if (screen_profile === undefined && orientationActuallyChanged) {
+      existingProfileObj.orientation = orientation;
+      const { parseProfile, getPreset } = require('../lib/embedded-profiles');
+      const w = parseInt(device.screen_width);
+      const h = parseInt(device.screen_height);
+      const preset = existingProfileObj.preset ? getPreset(existingProfileObj.preset) : null;
+      if (preset && preset.parameterizedDimensions && (!existingProfileObj.width || !existingProfileObj.height) && w > 0 && h > 0) {
+        if (w !== preset.width || h !== preset.height) {
+          existingProfileObj.width = w;
+          existingProfileObj.height = h;
+        }
+      }
+      if (parseProfile(existingProfileObj)) {
+        updates.push('screen_profile = ?');
+        values.push(JSON.stringify(existingProfileObj));
+      }
+    }
+  }
   if (screen_profile !== undefined) {
     // Only an embedded (server-rendered) panel has a render profile. Anything else would silently
     // keep it and ignore it, so refuse rather than store a setting nothing reads.
@@ -878,12 +925,41 @@ router.put('/:id', (req, res) => {
     }
     let profileVal = null;
     if (screen_profile !== null && screen_profile !== '') {
-      const { parseProfile } = require('../lib/embedded-profiles');
-      const parsed = parseProfile(screen_profile);
+      let profileObj = null;
+      if (typeof screen_profile === 'object' && screen_profile) {
+        profileObj = { ...screen_profile };
+      } else if (typeof screen_profile === 'string') {
+        const trimmed = screen_profile.trim();
+        if (trimmed.startsWith('{')) {
+          try { profileObj = JSON.parse(trimmed); } catch (_) {}
+        }
+        if (!profileObj) {
+          profileObj = { preset: trimmed };
+        }
+      }
+
+      if (orientation !== undefined && profileObj && !profileObj.orientation) {
+        profileObj.orientation = orientation;
+      }
+
+      const { parseProfile, getPreset } = require('../lib/embedded-profiles');
+      const w = parseInt(device.screen_width);
+      const h = parseInt(device.screen_height);
+      const preset = profileObj && profileObj.preset ? getPreset(profileObj.preset) : null;
+      if (preset && preset.parameterizedDimensions && (!profileObj.width || !profileObj.height) && w > 0 && h > 0) {
+        if (w !== preset.width || h !== preset.height) {
+          profileObj.width = w;
+          profileObj.height = h;
+        }
+      }
+
+      const parsed = parseProfile(profileObj || screen_profile);
       if (!parsed) {
         return res.status(400).json({ error: 'Invalid screen_profile' });
       }
-      profileVal = typeof screen_profile === 'object' ? JSON.stringify(screen_profile) : String(screen_profile);
+      profileVal = (profileObj && (profileObj.orientation || typeof screen_profile === 'object' || profileObj.width || profileObj.height))
+        ? JSON.stringify(profileObj)
+        : String(screen_profile);
     }
     updates.push('screen_profile = ?'); values.push(profileVal);
   }
@@ -918,6 +994,16 @@ router.put('/:id', (req, res) => {
     // Allowed on a head office screen, and recorded so head office can see who changed it.
     if (orientation !== undefined || timezone !== undefined) {
       require('../lib/corporate/guard').auditMandatedAction(req, device, orientation !== undefined ? 'orientation' : 'timezone');
+    }
+    /*
+     * ⚠️ These columns travel in the playlist payload, which was only sent on (re)connect: Save
+     * Settings stored a new Default Content / orientation / background and the screen kept the old
+     * one until it next reconnected. Push now (or queue for an offline screen). The group push
+     * above already sent this screen a fresh payload when dynOps is set.
+     */
+    const payloadFields = [orientation, timezone, background_color, default_content_id, layout_id];
+    if (!dynOps.length && payloadFields.some((v) => v !== undefined)) {
+      groupRules.pushTo(req.app.get('io'), [req.params.id]);
     }
   }
 
@@ -1566,6 +1652,9 @@ router.delete('/:id', (req, res) => {
     db.prepare('DELETE FROM device_telemetry WHERE device_id = ?').run(id);
     db.prepare('DELETE FROM device_diagnostic_logs WHERE device_id = ?').run(id);
     db.prepare('DELETE FROM video_wall_devices WHERE device_id = ?').run(id);
+    // #720: its Wi-Fi passwords go with it. The panel keeps the networks it joined (lib/device-wifi.js):
+    // a deleted screen is never sent a list again, so nothing tells it to drop them.
+    db.prepare('DELETE FROM device_wifi_networks WHERE device_id = ?').run(id);
     db.prepare('DELETE FROM devices WHERE id = ?').run(id);
 
     // Notify dashboard in real-time. Phase 2.3: scope to the device's

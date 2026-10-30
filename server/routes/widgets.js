@@ -13,6 +13,7 @@ const { PLATFORM_ROLES, ELEVATED_ROLES } = require('../middleware/auth');
 const { denyReadOnly, resourceAccess } = require('../lib/tenancy');
 const { isRealTimezone } = require('../lib/device-timezone');
 const { escapeHtml, safeUrl, safeCss, safeNumber } = require('../lib/widget-sanitize');
+const backgrounds = require('../lib/backgrounds');
 const pluginRegistry = require('../lib/plugins/registry');
 const { BUILTIN_WIDGET_TYPES } = require('../lib/plugins/reserved');
 const { redactSecrets, mergeSecrets, fieldsForWidget, redactConfigJson } = require('../lib/plugins/secrets');
@@ -130,6 +131,9 @@ function clockDatePosition(position) {
  * own locale — the right default for a screen standing in a particular country.
  */
 const LOCALE_RE = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$/;
+// fixHourCycle (lib/hour-cycle.js): a 12-hour clock never shows 00:38 pm.
+const { FIX_HOUR_CYCLE_JS } = require('../lib/hour-cycle');
+
 function safeLocale(l) {
   if (!l || typeof l !== 'string') return 'undefined';      // literal `undefined` in the emitted JS
   return LOCALE_RE.test(l) ? `'${l}'` : 'undefined';
@@ -679,7 +683,7 @@ function cloudDocConfig(config) {
   try {
     const n = require('../lib/cloud-docs').normaliseCloudDoc(c.url, { delaySec: c.delay_sec, refreshMin: c.refresh_min });
     const zoom = Math.min(Math.max(Number(c.zoom) || 100, 25), 400);
-    const background = /^#[0-9a-f]{3,8}$/i.test(c.background || '') ? c.background : '#000000';
+    const background = require('../lib/safe-color').backgroundColor(c.background);
     return { config: { ...n, zoom, background } };
   } catch (e) {
     return { error: e.message };
@@ -691,6 +695,7 @@ function renderWidgetHtml(type, config, opts = {}) {
   switch (type) {
     case 'clock': return renderClock(config);
     case 'weather': return renderWeather(config);
+    case 'radar': return require('../lib/radar/widget').previewHtml(config, { origin: opts.origin });
     case 'rss': return renderRSS(config, { seed: opts.seed });
     case 'text': return renderText(config, iframeSandbox);
     case 'webpage': return renderWebpage(config, iframeSandbox, opts.origin);
@@ -778,7 +783,12 @@ function widgetIframeSandboxForWorkspace(workspaceId) {
 router.get('/:id/render', (req, res) => {
   const widget = db.prepare('SELECT * FROM widgets WHERE id = ?').get(req.params.id);
   if (!widget) return res.status(404).send('Widget not found');
-  const config = JSON.parse(widget.config || '{}');
+  // A weather, clock or radar widget set to follow the screen takes its place from the screen that
+  // asked (?device=, sent by every player); see lib/widget-location.js.
+  const widgetLocation = require('../lib/widget-location');
+  const place = widgetLocation.followsScreen(widget.widget_type, JSON.parse(widget.config || '{}'))
+    ? widgetLocation.screenPlace(db, req.query.device, widget.workspace_id) : null;
+  const config = widgetLocation.applyPlace(widget.widget_type, JSON.parse(widget.config || '{}'), place);
   const iframeSandbox = widgetIframeSandboxForWorkspace(widget.workspace_id);
   // This page is DESIGNED to be embedded by the player, which frames it in a
   // sandboxed (allow-scripts, no allow-same-origin) iframe = a null origin. The
@@ -786,6 +796,12 @@ router.get('/:id/render', (req, res) => {
   // widgets render blank in the web player. Drop it here; the sandbox - not
   // X-Frame-Options - is what isolates the widget (it can't read the dashboard JWT).
   res.removeHeader('X-Frame-Options');
+  // #660 "Transparent background" on a playlist item: the same page, drawn see-through. Every widget
+  // type below ends in its own res.send, so the page is changed here, once, on its way out.
+  if (backgrounds.wantsTransparent(req.query)) {
+    const send = res.send.bind(res);
+    res.send = (body) => send(typeof body === 'string' && res.statusCode < 300 ? backgrounds.forceTransparent(body) : body);
+  }
   // Caching is keyed on whether the caller pinned a revision.
   //
   // A URL carrying ?rev=<widget.updated_at> is content-addressed: those exact bytes cannot change
@@ -849,6 +865,17 @@ router.get('/:id/render', (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
     if (req.query.rev) res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    return res.send(out.html);
+  }
+  /*
+   * A weather radar (lib/radar/widget.js): our own map page, image tiles plus one CORS-open JSON
+   * index, so it runs in the opaque-origin sandbox a third-party radar site does not.
+   */
+  if (widget.widget_type === 'radar') {
+    const out = require('../lib/radar/widget').render(config, { origin: `${req.protocol}://${req.get('host')}` });
+    res.setHeader('Content-Security-Policy', out.csp);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
     return res.send(out.html);
   }
   if (widget.widget_type === 'bi-dashboard') {
@@ -1059,6 +1086,7 @@ router.post('/preview', (req, res) => {
     iframeSandbox: PREVIEW_IFRAME_SANDBOX,
     resolveData,
     resolveFont,
+    origin: `${req.protocol}://${req.get('host')}`,
   });
   if (req.workspaceId) html = inlineUserContent(html, req.workspaceId);
   res.setHeader('Content-Type', 'text/html');
@@ -1093,6 +1121,7 @@ router.post('/preview-session', (req, res) => {
     iframeSandbox: PREVIEW_IFRAME_SANDBOX,
     resolveData,
     resolveFont,
+    origin: `${req.protocol}://${req.get('host')}`,
   });
   previewStore.set(id, { html, widget_type, created: Date.now() });
   res.json({ id, url: `/api/widgets/preview-session/${id}` });
@@ -1141,9 +1170,10 @@ ${dateFirst ? dateHtml : ''}
 <div id="time"></div>
 ${dateFirst ? '' : dateHtml}
 <script>
+${FIX_HOUR_CYCLE_JS}
 function update() {
   // show_seconds defaults TRUE so existing widgets keep the clock they already had (#323).
-  const opts = { hour12: ${c.format !== '24h'}, timeZone: '${safeTimezone(c.timezone)}', hour:'2-digit', minute:'2-digit'${c.show_seconds === false ? '' : ", second:'2-digit'"} };
+  const opts = fixHourCycle(${safeLocale(c.locale)}, { hour12: ${c.format !== '24h'}, timeZone: '${safeTimezone(c.timezone)}', hour:'2-digit', minute:'2-digit'${c.show_seconds === false ? '' : ", second:'2-digit'"} });
   document.getElementById('time').textContent = new Date().toLocaleTimeString(${safeLocale(c.locale)}, opts);
   ${c.show_date !== false ? `document.getElementById('date').textContent = new Date().toLocaleDateString(${safeLocale(c.locale)}, { timeZone: '${safeTimezone(c.timezone)}', ${clockDateFormat(c.date_format)} });` : ''}
 }
@@ -1187,7 +1217,9 @@ async function load() {
   try {
     // #324: wttr.in accepts lang=, so "Sunny" can arrive in the operator's language rather than
     // always English. Same locale field the clock gained in #323; blank leaves wttr.in's default.
-    const r = await fetch('https://wttr.in/${encodeURIComponent(c.location || 'New York')}?format=j1${/^[A-Za-z]{2}$/.test(String(c.locale || '').slice(0, 2)) ? '&lang=' + encodeURIComponent(String(c.locale).slice(0, 2).toLowerCase()) : ''}');
+    // A widget following its screen fetches by the screen's coordinates (lib/widget-location.js);
+    // the label still shows the place name.
+    const r = await fetch('https://wttr.in/${encodeURIComponent(c.__place_query || c.location || 'New York')}?format=j1${/^[A-Za-z]{2}$/.test(String(c.locale || '').slice(0, 2)) ? '&lang=' + encodeURIComponent(String(c.locale).slice(0, 2).toLowerCase()) : ''}');
     const d = await r.json();
     const cur = d.current_condition[0];
     const unit = '${c.units === 'metric' ? 'temp_C' : 'temp_F'}';
@@ -1265,7 +1297,7 @@ function renderRSS(c, opts = {}) {
   const fg = safeCss(c.color, '#FFF');
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:${safeCss(c.background, '#000')}; color:${fg}; height:100vh; overflow:hidden; font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  body { background:${safeCss(c.background, 'transparent')}; color:${fg}; height:100vh; overflow:hidden; font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
   .ticker { display:flex; align-items:center; height:100%; white-space:nowrap; position:relative; will-change:transform; }
   .item { display:inline-block; padding:0 40px; font-size:${r.fontSize}px; color:${fg}; }
   .item .title { font-weight:600; }

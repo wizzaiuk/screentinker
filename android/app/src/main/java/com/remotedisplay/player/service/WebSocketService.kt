@@ -211,6 +211,15 @@ class WebSocketService : Service() {
             }
         }.also { it.restore(); it.start() }
 
+        // #720: the Wi-Fi networks the operator lists on the device page. Service-owned for the same
+        // reason as the power schedule: it must keep re-planning while no Activity is alive.
+        wifiNetworks = com.remotedisplay.player.net.WifiNetworkManager(applicationContext) { body ->
+            handler.post {
+                try { socket?.emit("device:wifi-result", body.put("device_id", config.deviceId)) }
+                catch (e: Throwable) { Log.w("WebSocketService", "wifi result emit: ${e.message}") }
+            }
+        }.also { it.restore(config.deviceId) }
+
         powerSchedule = com.remotedisplay.player.power.PowerScheduleManager(
             applicationContext,
             onApply = { off -> applyScheduledPower(off) },
@@ -593,6 +602,14 @@ class WebSocketService : Service() {
                     }
                 }
                 
+                // #720: the full managed Wi-Fi list (passwords included — the server only sends it over
+                // TLS). Applied on the main thread by WifiNetworkManager; never logged beyond a count.
+                safeOn("device:wifi-networks") { args ->
+                    val data = args.getOrNull(0) as? JSONObject ?: return@safeOn
+                    Log.i("WebSocketService", "Wi-Fi list received: ${data.optJSONArray("networks")?.length() ?: 0} network(s)")
+                    handler.post { try { wifiNetworks?.apply(data, config.deviceId) } catch (e: Throwable) { Log.w("WebSocketService", "wifi apply: ${e.javaClass.simpleName}") } }
+                }
+
                 safeOn("device:playlist-update") { args ->
                     val data = args.firstOrNull() as? JSONObject ?: run {
                         Log.w("WebSocketService", "playlist-update with non-JSONObject payload: ${args.firstOrNull()}")
@@ -708,6 +725,9 @@ class WebSocketService : Service() {
                 safeOn("device:screenshare-start") { args -> screenShare.onStart(args.firstOrNull() as? JSONObject) }
                 safeOn("device:screenshare-stop") { args -> screenShare.onStop(args.firstOrNull() as? JSONObject) }
                 safeOn("device:screenshare-code") { args -> screenShare.onCode(args.firstOrNull() as? JSONObject) }
+                // Several presenters at once (remote.screen_share_tiles): which one fills the screen
+                // (spotlight, null = tiles) and whose sound plays — {spotlight, audio, count}.
+                safeOn("device:screenshare-layout") { args -> screenShare.onLayout(args.firstOrNull() as? JSONObject) }
 
                 safeOn("device:remote-touch") { args ->
                     if (privacyOn()) { Log.i("WebSocketService", "remote touch refused: interactive session in progress"); return@safeOn }
@@ -1127,6 +1147,7 @@ class WebSocketService : Service() {
      * screen_on branch above already carries in writing.
      */
     private var powerSchedule: com.remotedisplay.player.power.PowerScheduleManager? = null
+    private var wifiNetworks: com.remotedisplay.player.net.WifiNetworkManager? = null
 
     /** Saved REST endpoints this panel runs on its own clock. See EndpointPoller for why it lives here. */
     private var endpointPoller: com.remotedisplay.player.net.EndpointPoller? = null
@@ -2049,6 +2070,8 @@ class WebSocketService : Service() {
         } catch (e: Throwable) { /* never let the last gasp block teardown */ }
         val ctx = applicationContext
         Thread { ExitSignal.send(ctx, "clean_exit", "onDestroy") }.apply { start(); try { join(1500) } catch (e: InterruptedException) { /* proceed with teardown */ } }
+        try { wifiNetworks?.stop() } catch (e: Throwable) { /* teardown is best-effort */ }
+        wifiNetworks = null
         try { powerSchedule?.stop() } catch (e: Throwable) { /* teardown is best-effort */ }
         powerSchedule = null
         try { endpointPoller?.stop() } catch (e: Throwable) { /* teardown is best-effort */ }
@@ -2137,6 +2160,20 @@ class WebSocketService : Service() {
         }
     }
 
+    /**
+     * Hold the Wi-Fi multicast lock for one WS-Discovery probe and return its release.
+     *
+     * Many Wi-Fi drivers drop multicast (and some the unicast replies that follow) while the
+     * screen is "idle" to save power; the lock keeps the filter open for the few seconds a probe
+     * listens. Not reference-counted, so concurrent probes each own their own lock. On a wired
+     * panel there is no Wi-Fi to lock and the probe simply runs without one.
+     */
+    private fun acquireMulticastLock(): () -> Unit {
+        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return {}
+        val lock = wm.createMulticastLock("st-onvif-probe").apply { setReferenceCounted(false); acquire() }
+        return { try { if (lock.isHeld) lock.release() } catch (_: Throwable) {} }
+    }
+
     private fun dispatchCommand(type: String, payload: org.json.JSONObject?) {
         when (type) {
             "launch" -> {
@@ -2215,6 +2252,31 @@ class WebSocketService : Service() {
                 } catch (e: Throwable) {
                     Log.e("WebSocketService", "http_request: ${e.message}")
                 }
+            }.apply { isDaemon = true }.start()
+            /*
+             * This screen as the ONVIF bridge for cameras on its LAN (net/OnvifRelay.kt). Worker
+             * thread for the same reason as http_request: a probe listens for seconds and a SOAP
+             * call to a dead camera blocks for its whole timeout.
+             *
+             * ⚠️ EXACTLY ONE REPLY PER REQUEST, even on a refusal or a crash: the server is
+             * holding a promise for this id and otherwise reports "the screen did not answer"
+             * after its own timeout, which tells the installer nothing. OnvifRelay.perform never
+             * throws; the catch here only covers building the reply itself.
+             */
+            "onvif_relay" -> Thread {
+                val id = payload?.optString("id", "") ?: ""
+                val out = try {
+                    com.remotedisplay.player.net.OnvifRelay.perform(payload) { acquireMulticastLock() }
+                } catch (e: Throwable) {
+                    Log.e("WebSocketService", "onvif_relay: ${e.message}")
+                    com.remotedisplay.player.net.OnvifRelay.error(id, "failed")
+                }
+                try { out.put("device_id", config.deviceId) } catch (_: Throwable) {}
+                handler.post {
+                    try { socket?.emit("device:onvif-result", out) }
+                    catch (e: Throwable) { Log.w("WebSocketService", "onvif-result emit: ${e.message}") }
+                }
+                Log.i("WebSocketService", "onvif_relay ${payload?.optString("op")} ok=${out.optBoolean("ok")} ${out.optString("error", "")}")
             }.apply { isDaemon = true }.start()
             // Was a no-op because `input keyevent 224` is denied to an app UID — but a
             // wake LOCK is a different mechanism needing only WAKE_LOCK, which we hold.

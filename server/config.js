@@ -82,6 +82,7 @@ module.exports = {
   rateLimitBackstopAnon: backstop.parseLimit(process.env.RATE_LIMIT_BACKSTOP_ANON, backstop.DEFAULT_ANON_MAX),
 
   port: process.env.PORT || 3001,
+  accessLogEnabled: process.env.ACCESS_LOG === 'true',
   httpsPort: process.env.HTTPS_PORT || 3443,
   dataDir: DATA_DIR,
   dbPath: process.env.DB_PATH || path.join(DATA_DIR, 'db', 'remote_display.db'),
@@ -145,6 +146,14 @@ module.exports = {
   // Scale-out C3: disk a replica may spend on cached media, PER primary (edge). 10 GiB unless set.
   replicaCacheBytes: (() => { const n = Number(process.env.REPLICA_CACHE_BYTES); return Number.isFinite(n) && n > 0 ? Math.floor(n) : 10 * 1024 * 1024 * 1024; })(),
   primaryRedirect: ['1', 'true', 'yes'].includes(String(process.env.PRIMARY_REDIRECT || '').toLowerCase()),
+  /*
+   * Scale-out dial-out (lib/mesh/dial-out.js): join PRIMARY_URL at boot with an invite minted there,
+   * so an installed replica pairs itself. Ignored once an edge to that primary exists. ROLES are the
+   * extras this server takes on besides the copy (caches-content, terminates-players).
+   */
+  replicaJoinCode: String(process.env.REPLICA_JOIN_CODE || '').trim() || null,
+  replicaJoinRoles: String(process.env.REPLICA_JOIN_ROLES ?? 'caches-content').split(',').map((r) => r.trim()).filter(Boolean),
+  replicaJoinTlsVerify: !['0', 'false', 'no'].includes(String(process.env.REPLICA_JOIN_TLS_VERIFY || '').toLowerCase()),
   // Browser origins allowed to call /mcp cross-origin (comma-separated, exact match). Empty = none:
   // MCP clients are native or server-side and need no CORS. See the note on mcpCors in server.js.
   mcpCorsOrigins: String(process.env.MCP_CORS_ORIGINS || '').split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean),
@@ -627,6 +636,12 @@ module.exports = {
   // #talk: dedicated master switch for the voice intercom / PA feature, separate from live video.
   // Per-org enablement lives in organizations.talk_enabled; this is the global gate. Off by default.
   talkEnabled: process.env.TALK_ENABLED === 'true',
+  /*
+   * #720: hand a screen its Wi-Fi passwords over a connection that is NOT HTTPS. Off by default:
+   * lib/device-wifi.js refuses unless the device socket is TLS (natively, or through a trusted proxy
+   * that says https). Only for an install that runs on a LAN it trusts end to end; logged at boot.
+   */
+  wifiAllowInsecure: process.env.WIFI_ALLOW_INSECURE === '1' || process.env.WIFI_ALLOW_INSECURE === 'true',
   /*
    * 3.0: screen share to a screen (lib/screen-share.js, docs/screen-share.md). ON by default: it
    * needs no sidecar (peer-to-peer WebRTC, this server only relays signalling), only an editor can

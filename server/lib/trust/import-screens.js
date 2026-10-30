@@ -41,6 +41,7 @@ const PLAYER_OWNED = new Set([
   'offline_detail', 'heartbeat_expected_by', 'created_at', 'render_width', 'render_height', 'ota_status', 'ota_target_version',
   'ota_attempts', 'ota_updated_at', 'ota_channel_served', 'attached_node_id', 'power_source', 'trigger_status',
   'trigger_status_at', 'claim_secret', 'view_token_hash', 'view_token_enc', 'screen_profile', 'reported_orientation', 'reported_board',
+  'offline_cache', 'offline_cache_at',
 ]);
 
 function jobWorkspaces(db, job) {
@@ -124,7 +125,8 @@ function pairInto(db, { importedId, code, orgId }) {
   const prov = db.prepare('SELECT * FROM devices WHERE pairing_code = ?').get(String(code || ''));
   if (!prov) return { error: 'No screen is showing that pairing code', status: 404, guess: true };
   if (prov.user_id || prov.workspace_id) return { error: 'That pairing code belongs to a screen that is already in use', status: 409 };
-  if (require('../pair-lockout').isCodeExpired(prov.last_heartbeat || prov.created_at)) return { error: 'Pairing code expired - restart the display to get a new code', status: 410 };
+  const pairLockout = require('../pair-lockout');
+  if (pairLockout.isCodeExpired(prov.last_heartbeat || prov.created_at)) return { error: pairLockout.CODE_EXPIRED_MESSAGE, status: 410 };
 
   const cols = db.prepare('PRAGMA table_info(devices)').all().map((c) => c.name).filter((c) => !PLAYER_OWNED.has(c));
   const refs = deviceReferences(db);

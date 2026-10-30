@@ -277,7 +277,7 @@
 <body>
   <!-- Setup Screen -->
   <div id="setupScreen">
-    <h1>ScreenTinker</h1>
+    <h1 data-brand>ScreenTinker</h1>
     <div class="subtitle">Web Player</div>
     <div class="form" id="urlForm">
       <label>Server URL</label>
@@ -312,7 +312,7 @@
   <!-- Status Overlay -->
   <div id="statusOverlay" style="display:none">
     <div class="spinner"></div>
-    <h2>ScreenTinker</h2>
+    <h2 data-brand>ScreenTinker</h2>
     <p id="statusText" data-i18n="connecting">Connecting...</p>
   </div>
 
@@ -726,6 +726,49 @@ function linkStorageSuffix(k) {
   return "::" + h(2166136261) + h(2538058380);
 }
 const LINK_SUFFIX = VIEWER_MODE ? "" : linkStorageSuffix(urlEnrolKey());
+const BRAND_KEY = "st_brand" + LINK_SUFFIX;
+function servedBrand() {
+  const b = window.__playerConfig && window.__playerConfig.brand;
+  return b && typeof b.name === "string" ? { name: b.name, hidden: !!b.hidden } : { name: "ScreenTinker", hidden: false };
+}
+let playerBrand = (() => {
+  try {
+    const c = JSON.parse(localStorage.getItem(BRAND_KEY) || "null");
+    if (c && typeof c.name === "string") return { name: c.name, hidden: !!c.hidden };
+  } catch (e) {
+  }
+  return servedBrand();
+})();
+function brandTitle() {
+  if (playerBrand.hidden || !playerBrand.name) return _t("web_player");
+  return _t("info_title").replace("ScreenTinker", playerBrand.name);
+}
+function applyBrand(b) {
+  if (b && typeof b.name === "string") {
+    playerBrand = { name: b.name, hidden: !!b.hidden };
+    try {
+      localStorage.setItem(BRAND_KEY, JSON.stringify(playerBrand));
+    } catch (e) {
+    }
+  }
+  document.title = playerBrand.name ? playerBrand.name + " Player" : "Player";
+  document.querySelectorAll("[data-brand]").forEach((el) => {
+    el.textContent = playerBrand.name;
+    el.style.display = playerBrand.name ? "" : "none";
+  });
+  document.querySelectorAll("[data-brand-title]").forEach((el) => {
+    el.textContent = brandTitle();
+  });
+}
+function forgetBrand() {
+  try {
+    localStorage.removeItem(BRAND_KEY);
+  } catch (e) {
+  }
+  playerBrand = servedBrand();
+  applyBrand();
+}
+applyBrand();
 const SCREEN_SUFFIX = VIEWER_MODE ? "__view" : (() => {
   try {
     return BS ? BS.storageSuffix() || "" : "";
@@ -1101,6 +1144,60 @@ function postSiteCache(items) {
   } catch (e) {
   }
 }
+var OFFLINE_REPORT_AFTER_PIN_MS = 3e4;
+var OFFLINE_REPORT_EVERY_MS = 10 * 60 * 1e3;
+var offlineCacheUrls = null;
+var offlineReportTimer = null;
+var lastOfflineReport = "";
+var storagePersisted = null;
+function scheduleOfflineCacheReport(ms) {
+  if (offlineReportTimer) clearTimeout(offlineReportTimer);
+  offlineReportTimer = setTimeout(() => {
+    offlineReportTimer = null;
+    reportOfflineCache();
+    scheduleOfflineCacheReport(OFFLINE_REPORT_EVERY_MS);
+  }, ms);
+}
+function reportOfflineCache() {
+  try {
+    const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (!sw || !Array.isArray(offlineCacheUrls) || typeof MessageChannel !== "function") return;
+    const ch = new MessageChannel();
+    const timer = setTimeout(() => {
+      try {
+        ch.port1.close();
+      } catch (e) {
+      }
+    }, 15e3);
+    ch.port1.onmessage = (e) => {
+      clearTimeout(timer);
+      try {
+        ch.port1.close();
+      } catch (err) {
+      }
+      const s = e.data;
+      if (!s || typeof s !== "object" || s.error && typeof s.error === "string") return;
+      const report = {
+        wanted: s.wanted,
+        ready: s.ready,
+        ready_bytes: s.ready_bytes,
+        partial: s.partial,
+        partial_bytes: s.partial_bytes,
+        usage: s.usage,
+        quota: s.quota,
+        persisted: storagePersisted,
+        error: s.error && s.error.name ? s.error.name : null
+      };
+      const sig = JSON.stringify(report);
+      if (sig === lastOfflineReport || !socket || !socket.connected || !config.deviceId) return;
+      lastOfflineReport = sig;
+      socket.emit("device:cache-status", __spreadValues({ device_id: config.deviceId }, report));
+      if (s.error && s.error.name) console.warn("[cache] " + s.ready + "/" + s.wanted + " offline-ready; last error: " + s.error.name + " " + (s.error.message || ""));
+    };
+    sw.postMessage({ type: "st-cache-status", urls: offlineCacheUrls }, [ch.port2]);
+  } catch (e) {
+  }
+}
 function requestOfflineCache(items, extraItems) {
   try {
     const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
@@ -1109,10 +1206,12 @@ function requestOfflineCache(items, extraItems) {
     const urls = all.filter((it) => it && it.filepath && !it.remote_url).map((it) => mediaUrl(it));
     postSiteCache(all);
     sw.postMessage({ type: "st-cache-playlist", urls, prune: true, scope: SCREEN_SUFFIX });
+    offlineCacheUrls = urls;
+    scheduleOfflineCacheReport(OFFLINE_REPORT_AFTER_PIN_MS);
     for (const it of all) {
       if (!it || it.mime_type !== BUNDLE_MIME || !it.content_id) continue;
       fetch(
-        "".concat(config.serverUrl, "/api/content/").concat(it.content_id, "/bundle?rev=").concat(it.content_rev || 0),
+        "".concat(config.serverUrl, "/api/content/").concat(it.content_id, "/bundle?rev=").concat(it.content_rev || 0).concat(it.transparent_bg ? "&transparent=1" : ""),
         { credentials: "omit" }
       ).catch(() => {
       });
@@ -1749,6 +1848,9 @@ function mediaFailureSkip(el, label, src, mayAdvance = true) {
   if (mayAdvance) scheduleAdvance(nextItem, 3e3);
 }
 const UNKNOWN_ITEM_HOLD_MS = 15e3;
+function isRenderableItem(item) {
+  return !!(item && (item.widget_id || item.mime_type === BUNDLE_MIME || item.mime_type === "video/youtube" || typeof item.mime_type === "string" && (item.mime_type.startsWith("video/") || item.mime_type.startsWith("image/"))));
+}
 const BUNDLE_MIME = "application/vnd.screentinker.bundle+zip";
 const bundleSkipFrames = /* @__PURE__ */ new Set();
 let fullscreenBundleReg = null;
@@ -2523,7 +2625,7 @@ if (VIEWER_MODE) {
     {
       const tapOverlay = document.createElement("div");
       tapOverlay.style.cssText = "position:fixed;top:0;right:0;bottom:0;left:0;background:#111827;z-index:2000;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer";
-      tapOverlay.innerHTML = '\n          <h1 style="color:#3b82f6;font-size:3.6rem;font-family:sans-serif;margin-bottom:1.2rem">ScreenTinker</h1>\n          <p style="color:#94a3b8;font-size:1.8rem;font-family:sans-serif">Tap anywhere to start</p>\n          <p style="color:#64748b;font-size:1.3rem;font-family:sans-serif;margin-top:2.4rem">Audio requires user interaction</p>\n        ';
+      tapOverlay.innerHTML = '\n          <h1 data-brand style="color:#3b82f6;font-size:3.6rem;font-family:sans-serif;margin-bottom:1.2rem"></h1>\n          <p style="color:#94a3b8;font-size:1.8rem;font-family:sans-serif">Tap anywhere to start</p>\n          <p style="color:#64748b;font-size:1.3rem;font-family:sans-serif;margin-top:2.4rem">Audio requires user interaction</p>\n        ';
       tapOverlay.onclick = () => {
         unlockAudio();
         tapOverlay.remove();
@@ -2531,6 +2633,7 @@ if (VIEWER_MODE) {
         connect(config.serverUrl);
       };
       document.body.appendChild(tapOverlay);
+      applyBrand();
       setTimeout(() => {
         if (tapOverlay.parentNode) {
           tapOverlay.remove();
@@ -3107,12 +3210,13 @@ function connect(serverUrl) {
     config.paired = true;
     config.deviceName = data.name;
     if (data && data.settings_pin) config.settingsPin = String(data.settings_pin);
+    if (data && data.brand) applyBrand(data.brand);
     saveConfig(config);
     console.log("Paired as:", data.name);
     document.getElementById("setupScreen").style.display = "none";
     const PMH = window.PlayerMediaHealth;
     const showIdle = PMH && typeof PMH.shouldShowIdle === "function" ? PMH.shouldShowIdle({ isPlaying, hasContent: playlist.length > 0 }) : !isPlaying;
-    if (showIdle) showStatus("Waiting for content...");
+    if (showIdle && !renderDefaultContent()) showStatus("Waiting for content...");
   });
   function clearShareForUnpaired() {
     try {
@@ -3125,6 +3229,7 @@ function connect(serverUrl) {
   }
   function enterRepairMode(message) {
     clearShareForUnpaired();
+    forgetBrand();
     delete config.deviceId;
     delete config.deviceToken;
     config.paired = false;
@@ -4418,6 +4523,28 @@ function hostPackageVersion() {
     return null;
   }
 }
+function renderSize() {
+  const dpr = window.devicePixelRatio || 1;
+  let w = Math.round((window.innerWidth || 0) * dpr), h = Math.round((window.innerHeight || 0) * dpr);
+  if (cssQuarterTurn === 90 || cssQuarterTurn === 270) {
+    const t = w;
+    w = h;
+    h = t;
+  }
+  return w > 0 && h > 0 ? { w, h } : null;
+}
+let reportedRenderKey = "";
+function maybeReportRenderSize() {
+  const r = renderSize();
+  const key = r ? r.w + "x" + r.h : "";
+  if (!key || key === reportedRenderKey || !socket || !socket.connected || !config.deviceId) return;
+  socket.emit("device:info", { device_id: config.deviceId, device_info: buildDeviceInfo() });
+}
+let renderSizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(renderSizeTimer);
+  renderSizeTimer = setTimeout(maybeReportRenderSize, 2e3);
+});
 function buildDeviceInfo() {
   const info = {
     android_version: "Web/" + navigator.userAgent.split(" ").pop(),
@@ -4431,6 +4558,12 @@ function buildDeviceInfo() {
     screen_width: screen.width,
     screen_height: screen.height
   };
+  const r = renderSize();
+  if (r) {
+    info.render_width = r.w;
+    info.render_height = r.h;
+    reportedRenderKey = r.w + "x" + r.h;
+  }
   try {
     if (typeof HOST !== "undefined" && HOST && HOST.info) {
       if (HOST.info.version) info.app_version = String(HOST.info.version);
@@ -4995,6 +5128,17 @@ function handlePlaylistUpdate(data) {
     return;
   }
   if (data.suspended) {
+    teardownCurrentMedia();
+    stopSlideVo();
+    stopSlideBed();
+    clearTimeout(scheduleRetryTimer);
+    clearLookahead();
+    deferredRotation = false;
+    if (deferredRotationDeadline) {
+      clearTimeout(deferredRotationDeadline);
+      deferredRotationDeadline = null;
+    }
+    if (campaign) stopCampaign();
     isPlaying = false;
     playlist = [];
     document.getElementById("playerContainer").style.display = "none";
@@ -5010,7 +5154,7 @@ function handlePlaylistUpdate(data) {
     for (const k of Object.keys(zoneOrderState)) delete zoneOrderState[k];
   }
   if (data.playback_order) playbackOrder = data.playback_order;
-  const fingerprint = (items) => items.map((a) => "".concat(a.content_id || "", "|").concat(a.widget_id || "", "|").concat(a.widget_rev || "", "|").concat(a.zone_id || "", "|").concat(a.remote_url || "", "|").concat(a.filepath || "", "|").concat(a.filename || "", "|").concat(JSON.stringify(a.schedules || []), "|").concat(a.play_from || "", "|").concat(a.play_until || "", "|").concat(a.enabled === 0 ? 0 : 1, "|").concat(a.log_play === 0 ? 0 : 1, "|").concat(a.fit_mode || "", "|").concat(JSON.stringify(a.play_when || null), "|").concat(JSON.stringify(a.tags || []), "|").concat(JSON.stringify(a.meta || {}), "|").concat(JSON.stringify(a.transition || null))).join(",");
+  const fingerprint = (items) => items.map((a) => "".concat(a.content_id || "", "|").concat(a.widget_id || "", "|").concat(a.widget_rev || "", "|").concat(a.zone_id || "", "|").concat(a.remote_url || "", "|").concat(a.filepath || "", "|").concat(a.filename || "", "|").concat(JSON.stringify(a.schedules || []), "|").concat(a.play_from || "", "|").concat(a.play_until || "", "|").concat(a.enabled === 0 ? 0 : 1, "|").concat(a.log_play === 0 ? 0 : 1, "|").concat(a.fit_mode || "", "|").concat(JSON.stringify(a.play_when || null), "|").concat(JSON.stringify(a.tags || []), "|").concat(JSON.stringify(a.meta || {}), "|").concat(JSON.stringify(a.transition || null)).concat(a.transparent_bg ? "|t" : "")).join(",");
   const newFp = fingerprint(newItems);
   const oldFp = fingerprint(playlist);
   const effectiveOrientation = window.WallGeometry ? window.WallGeometry.orientationForWallMember(data.orientation, (_a = data.wall_config) == null ? void 0 : _a.rotation) : data.orientation;
@@ -5019,10 +5163,11 @@ function handlePlaylistUpdate(data) {
       if (typeof data.custom_shaders[id] === "string") window.__TRANSITION_SHADERS[id] = data.custom_shaders[id];
     }
   }
-  if (data.background_color && /^#[0-9a-fA-F]{3,8}$/.test(data.background_color)) {
+  {
+    const bg = data.background_color && /^#[0-9a-fA-F]{3,8}$/.test(data.background_color) ? data.background_color : "";
     const stage = document.getElementById("playerContainer");
-    if (stage) stage.style.background = data.background_color;
-    document.body.style.background = data.background_color;
+    if (stage) stage.style.background = bg;
+    document.body.style.background = bg;
   }
   const prevDefault = defaultContent && defaultContent.content_rev;
   defaultContent = data.default_content && typeof data.default_content === "object" ? data.default_content : null;
@@ -5055,6 +5200,7 @@ function handlePlaylistUpdate(data) {
         el.style.left = st.left;
       });
     }
+    maybeReportRenderSize();
   }
   function wallKey(c) {
     if (!c) return "";
@@ -5183,6 +5329,14 @@ function handlePlaylistUpdate(data) {
     return;
   }
   document.getElementById("setupScreen").style.display = "none";
+  if (layout && layout.zones && layout.zones.length > 1 && !wallConfig) {
+    console.log("Playlist changed in a multi-zone layout - re-rendering all zones (#725)");
+    const survivor = playlist.findIndex((x) => identityOf(x) === oldAnchorId);
+    currentIndex = survivor !== -1 ? survivor : 0;
+    isPlaying = true;
+    renderContent(playlist[currentIndex]);
+    return;
+  }
   if (oldAnchorId && oldAnchorId !== "|||") {
     const stillThereIdx = playlist.findIndex((x) => identityOf(x) === oldAnchorId);
     if (stillThereIdx !== -1) {
@@ -5297,7 +5451,10 @@ function renderDefaultContent() {
   if (!dc || typeof dc.mime_type !== "string" || !dc.mime_type.startsWith("image/")) return false;
   const container = document.getElementById("playerContainer");
   const key = dc.content_rev || dc.content_id || dc.remote_url || dc.filepath;
-  if (_defaultShownRev === key && container && container.querySelector("img[data-st-default]")) return true;
+  if (_defaultShownRev === key && container && container.querySelector("img[data-st-default]")) {
+    hideStatus();
+    return true;
+  }
   teardownCurrentMedia();
   const img = document.createElement("img");
   img.setAttribute("data-st-default", "1");
@@ -5311,6 +5468,7 @@ function renderDefaultContent() {
     container.appendChild(img);
   }
   _defaultShownRev = key;
+  hideStatus();
   return true;
 }
 function showNothingScheduled() {
@@ -5462,13 +5620,14 @@ function loadYoutubeApi(cb) {
 }
 function createYoutubeEmbed(src, item, container, opts) {
   const zoneMode = !!(opts && opts.zone);
-  const done = zoneMode ? opts.onEnded || null : nextItem;
+  const syncFollower = !zoneMode && (typeof isWallFollower === "function" && isWallFollower() || typeof groupSync !== "undefined" && !!groupSync);
+  const done = zoneMode ? opts.onEnded || null : syncFollower ? null : nextItem;
   const videoId = extractVideoId(src);
   if (!videoId) {
     console.error("Could not extract YouTube video ID from:", src);
     if (zoneMode) {
       if (done) setTimeout(done, 2e3);
-    } else if (playlist.length > 1) setTimeout(nextItem, 2e3);
+    } else if (playlist.length > 1 && !syncFollower) setTimeout(nextItem, 2e3);
     return null;
   }
   let alive;
@@ -5522,11 +5681,11 @@ function createYoutubeEmbed(src, item, container, opts) {
   const isVertical = /st_aspect=vertical/i.test(src || "") || /st_aspect=vertical/i.test(item && item.remote_url || "");
   const playerDiv = document.createElement("div");
   playerDiv.id = "yt-player-" + Date.now();
-  playerDiv.style.cssText = "width:100%;height:100%;background:#000";
+  playerDiv.style.cssText = "width:100%;height:100%;background:transparent";
   let mountEl = playerDiv;
   if (isVertical) {
     const wrap = document.createElement("div");
-    wrap.style.cssText = "width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center";
+    wrap.style.cssText = "width:100%;height:100%;background:transparent;display:flex;align-items:center;justify-content:center";
     const inner = document.createElement("div");
     inner.style.cssText = "width:56.25vh;height:100%;max-width:100%";
     inner.appendChild(playerDiv);
@@ -5619,7 +5778,7 @@ function createYoutubeEmbed(src, item, container, opts) {
             if (done) setTimeout(() => {
               if (alive()) done();
             }, 2e3);
-          } else if (playlist.length > 1) {
+          } else if (playlist.length > 1 && !syncFollower) {
             console.log("Skipping unplayable YouTube video");
             setTimeout(nextItem, 2e3);
           }
@@ -5726,8 +5885,7 @@ function renderWidgetBuffered(item) {
   container.style.display = "block";
   discardPendingSwap();
   const iframe = document.createElement("iframe");
-  iframe.src = "".concat(config.serverUrl, "/api/widgets/").concat(item.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(item.widget_rev || 0).concat(item.widget_panel ? "#panel=" + encodeURIComponent(item.widget_panel) : "");
-  iframe.style.background = "#000";
+  iframe.src = "".concat(config.serverUrl, "/api/widgets/").concat(item.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(item.widget_rev || 0).concat(item.transparent_bg ? "&transparent=1" : "").concat(item.widget_panel ? "#panel=" + encodeURIComponent(item.widget_panel) : "");
   iframe.style.visibility = "hidden";
   iframe.allow = "autoplay; fullscreen";
   iframe.setAttribute("sandbox", widgetSandboxAttr(item));
@@ -5756,7 +5914,6 @@ function renderBundleBuffered(item) {
   container.style.display = "block";
   discardPendingSwap();
   const iframe = document.createElement("iframe");
-  iframe.style.background = "#000";
   iframe.style.visibility = "hidden";
   iframe.allow = "autoplay; fullscreen";
   iframe.setAttribute("sandbox", "allow-scripts");
@@ -5771,7 +5928,7 @@ function renderBundleBuffered(item) {
   fullscreenBundleReg = registerBundleFrame(iframe, (reg, reason) => fullscreenBundleSkip(reg, item, reason));
   container.appendChild(iframe);
   pendingWidgetSwap = { iframe, timer: setTimeout(discardPendingSwap, WIDGET_SWAP_TIMEOUT_MS) };
-  const url = "".concat(config.serverUrl, "/api/content/").concat(item.content_id, "/bundle?rev=").concat(item.content_rev || 0);
+  const url = "".concat(config.serverUrl, "/api/content/").concat(item.content_id, "/bundle?rev=").concat(item.content_rev || 0).concat(item.transparent_bg ? "&transparent=1" : "");
   fetch(url, { credentials: "omit" }).then((r) => r.ok ? r.text() : Promise.reject(new Error("HTTP " + r.status))).then((html) => {
     iframe.srcdoc = html;
   }).catch((e) => {
@@ -6504,11 +6661,11 @@ function renderContent(item) {
     renderWallZones(container);
     return;
   }
-  const hasRenderableType = item && (item.widget_id || item.mime_type === BUNDLE_MIME || item.mime_type === "video/youtube" || typeof item.mime_type === "string" && (item.mime_type.startsWith("video/") || item.mime_type.startsWith("image/")));
+  const hasRenderableType = isRenderableItem(item);
   if (!hasRenderableType) {
     showStatus("Waiting for content...");
     isPlaying = false;
-    const onlyItem = !playlist || playlist.length <= 1;
+    const onlyItem = !playlist || playlist.length <= 1 || !playlist.some((p) => p !== item && isRenderableItem(p));
     console.log("[player] skipping item with unrecognised type:", item && item.mime_type);
     scheduleAdvance(nextItem, onlyItem ? UNKNOWN_ITEM_HOLD_MS : 0);
     return;
@@ -6577,7 +6734,7 @@ function renderContent(item) {
       if (!isFollower) scheduleAdvance(nextItem, (item.duration_sec || 10) * 1e3);
     } else if (item.widget_id) {
       const iframe = document.createElement("iframe");
-      iframe.src = "".concat(serverUrl, "/api/widgets/").concat(item.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(item.widget_rev || 0).concat(item.widget_panel ? "#panel=" + encodeURIComponent(item.widget_panel) : "");
+      iframe.src = "".concat(serverUrl, "/api/widgets/").concat(item.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(item.widget_rev || 0).concat(item.transparent_bg ? "&transparent=1" : "").concat(item.widget_panel ? "#panel=" + encodeURIComponent(item.widget_panel) : "");
       iframe.style.cssText = "width:100%;height:100%;border:none;background:transparent";
       iframe.allow = "autoplay; fullscreen";
       iframe.setAttribute("sandbox", widgetSandboxAttr(item));
@@ -6791,14 +6948,18 @@ function renderZones(container, defaultItem) {
     renderPreviewBanner();
   }
   let unassignedUsed = false;
-  layout.zones.forEach((zone) => {
+  const zoneItems = layout.zones.map((zone) => {
     let items = byZone[zone.id];
     if ((!items || !items.length) && !unassignedUsed && byZone["__none__"]) {
       unassignedUsed = true;
       items = byZone["__none__"];
     }
-    if ((!items || !items.length) && defaultItem) items = [defaultItem];
-    if (!items || !items.length) return;
+    return items && items.length ? items : null;
+  });
+  if (!zoneItems.some(Boolean) && defaultItem && zoneItems.length) zoneItems[0] = [defaultItem];
+  layout.zones.forEach((zone, i) => {
+    const items = zoneItems[i];
+    if (!items) return;
     const div = document.createElement("div");
     div.className = "zone";
     div.style.cssText = "left:".concat(zone.x_percent, "%;top:").concat(zone.y_percent, "%;width:").concat(zone.width_percent, "%;height:").concat(zone.height_percent, "%;z-index:").concat(zone.z_index || 0);
@@ -6886,7 +7047,7 @@ function showZoneItem(zone, div, items, index, timers = zoneTimers) {
     const iframe = document.createElement("iframe");
     iframe.setAttribute("sandbox", "allow-scripts");
     iframe.allow = "autoplay; fullscreen";
-    const bundleUrl = "".concat(config.serverUrl, "/api/content/").concat(a.content_id, "/bundle?rev=").concat(a.content_rev || 0);
+    const bundleUrl = "".concat(config.serverUrl, "/api/content/").concat(a.content_id, "/bundle?rev=").concat(a.content_rev || 0).concat(a.transparent_bg ? "&transparent=1" : "");
     if (typeof registerBundleFrame === "function" && typeof zoneBundleSkip === "function") {
       div.__stBundleReg = registerBundleFrame(
         iframe,
@@ -6902,7 +7063,7 @@ function showZoneItem(zone, div, items, index, timers = zoneTimers) {
     if (multi) timers[zone.id] = setTimeout(advance, dur);
   } else if (a.widget_id) {
     const iframe = document.createElement("iframe");
-    iframe.src = "".concat(config.serverUrl, "/api/widgets/").concat(a.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(a.widget_rev || 0).concat(a.widget_panel ? "#panel=" + encodeURIComponent(a.widget_panel) : "");
+    iframe.src = "".concat(config.serverUrl, "/api/widgets/").concat(a.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(a.widget_rev || 0).concat(a.transparent_bg ? "&transparent=1" : "").concat(a.widget_panel ? "#panel=" + encodeURIComponent(a.widget_panel) : "");
     iframe.setAttribute("sandbox", widgetSandboxAttr(a));
     div.appendChild(iframe);
     if (PREVIEW_MODE && a.widget_type === "webpage") addWebpageNote(div);
@@ -7452,7 +7613,7 @@ function wallZoneElement(zs, a, opts) {
   const src = mediaUrl(a);
   if (a.widget_id) {
     const iframe = document.createElement("iframe");
-    iframe.src = "".concat(config.serverUrl, "/api/widgets/").concat(a.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(a.widget_rev || 0).concat(a.widget_panel ? "#panel=" + encodeURIComponent(a.widget_panel) : "");
+    iframe.src = "".concat(config.serverUrl, "/api/widgets/").concat(a.widget_id, "/render?device=").concat(encodeURIComponent(config.deviceId || ""), "&rev=").concat(a.widget_rev || 0).concat(a.transparent_bg ? "&transparent=1" : "").concat(a.widget_panel ? "#panel=" + encodeURIComponent(a.widget_panel) : "");
     iframe.setAttribute("sandbox", widgetSandboxAttr(a));
     return { el: iframe, video: null };
   }
@@ -7900,7 +8061,7 @@ function renderCaptureCanvas() {
       ctx.fillStyle = "#3b82f6";
       ctx.font = "bold 28px sans-serif";
       ctx.textAlign = "center";
-      ctx.fillText("ScreenTinker Web Player", W / 2, H / 2 - 40);
+      ctx.fillText(brandTitle(), W / 2, H / 2 - 40);
       ctx.fillStyle = "#94a3b8";
       ctx.font = "16px sans-serif";
       const item = playlist[currentIndex];
@@ -8138,11 +8299,12 @@ function toggleScreenOff() {
 const infoDiv = document.createElement("div");
 infoDiv.id = "infoOverlay";
 infoDiv.style.cssText = "position:fixed;top:0;right:0;bottom:0;left:0;background:rgba(0,0,0,0.85);z-index:800;display:none;flex-direction:column;align-items:center;justify-content:center;color:#f1f5f9;font-family:-apple-system,sans-serif";
-infoDiv.innerHTML = '\n      <h2 style="color:#3b82f6;margin-bottom:16px">'.concat(_t("info_title"), '</h2>\n      <div style="font-size:14px;line-height:2;text-align:center;color:#94a3b8" id="infoContent"></div>\n      <p style="margin-top:24px;font-size:12px;color:#64748b">').concat(_t("info_close_hint"), "</p>\n    ");
+infoDiv.innerHTML = '\n      <h2 data-brand-title style="color:#3b82f6;margin-bottom:16px"></h2>\n      <div style="font-size:14px;line-height:2;text-align:center;color:#94a3b8" id="infoContent"></div>\n      <p style="margin-top:24px;font-size:12px;color:#64748b">'.concat(_t("info_close_hint"), "</p>\n    ");
 infoDiv.onclick = () => {
   infoDiv.style.display = "none";
 };
 document.body.appendChild(infoDiv);
+applyBrand();
 const escHtml = (s) => s == null ? "" : String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 setInterval(() => {
   var _a, _b;
@@ -8266,6 +8428,16 @@ if ("serviceWorker" in navigator && !VIEWER_MODE) {
   const serviceWorkerUrl = IS_LEGACY_PLAYER ? "/sw-legacy.js" : "/sw.js";
   navigator.serviceWorker.register(serviceWorkerUrl).then((reg) => {
     console.log("Service Worker registered");
+    try {
+      if (navigator.storage && typeof navigator.storage.persist === "function") {
+        navigator.storage.persist().then((ok) => {
+          storagePersisted = !!ok;
+        }, () => {
+          storagePersisted = false;
+        });
+      }
+    } catch (e) {
+    }
     navigator.serviceWorker.ready.then(() => {
       try {
         if (Array.isArray(playlist) && playlist.length) {

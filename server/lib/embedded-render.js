@@ -26,8 +26,8 @@ const { assertSafeUrl, guardedRequest, SsrfError } = require('./ssrf-guard');
 const REMOTE_IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 
 const VALID_FIT_MODES = new Set(['cover', 'contain', 'fill']);
-function safeFitMode(m) {
-  return (typeof m === 'string' && VALID_FIT_MODES.has(m.toLowerCase())) ? m.toLowerCase() : 'contain';
+function safeFitMode(m, fallback = 'contain') {
+  return (typeof m === 'string' && VALID_FIT_MODES.has(m.toLowerCase())) ? m.toLowerCase() : fallback;
 }
 function safeHexColor(c, fallback = '#000000') {
   if (!c || typeof c !== 'string') return fallback;
@@ -220,6 +220,20 @@ function parseColorToRgba(hexOrInt, fallback = 0x000000FF) {
   return fallback;
 }
 
+function fitImageOntoCanvas(img, width, height, fitMode, bgColorHex) {
+  const bgRgba = parseColorToRgba(safeHexColor(bgColorHex, '#000000'), 0x000000FF);
+  const canvas = new Jimp({ width, height, color: bgRgba });
+  if (fitMode === 'cover') {
+    img.cover({ w: width, h: height });
+  } else if (fitMode === 'fill') {
+    img.resize({ w: width, h: height });
+  } else {
+    img.contain({ w: width, h: height });
+  }
+  canvas.composite(img, 0, 0);
+  return canvas;
+}
+
 function withTimeout(promise, ms = 15000, timeoutErrorMsg = 'Render timed out') {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
@@ -274,7 +288,7 @@ function releasePageSlot() {
   }
 }
 
-async function renderRemoteImage(content, profile) {
+async function renderRemoteImage(content, profile, options = {}, item = null) {
   const url = content.remote_url;
   if (!url) return null;
 
@@ -303,8 +317,10 @@ async function renderRemoteImage(content, profile) {
 
   const buf = response.buffer;
   const img = await Jimp.fromBuffer(buf);
-  img.cover({ w: profile.width, h: profile.height });
-  return img.getBuffer('image/png');
+  const fitMode = safeFitMode((item && item.fit_mode) || options?.fitMode, options?.defaultFitMode || 'cover');
+  const bgColorHex = options?.backgroundColor || options?.device?.background_color;
+  const canvas = fitImageOntoCanvas(img, profile.width, profile.height, fitMode, bgColorHex);
+  return canvas.getBuffer('image/png');
 }
 
 function localBaseUrl() {
@@ -718,7 +734,7 @@ async function render(item, content, screenProfile, options = {}) {
     // (a dashboard/web page) skips the guarded image GET and goes straight to the browser render —
     // both cheaper and cleaner than fetching an HTML page just to discover it is not an image.
     const maybeImage = !content.mime_type || looksLikeImage(content.remote_url, content.mime_type);
-    const png = maybeImage ? await renderRemoteImage(content, profile) : null;
+    const png = maybeImage ? await renderRemoteImage(content, profile, options, item) : null;
     if (png) return { png };
 
     try {
@@ -746,8 +762,10 @@ async function render(item, content, screenProfile, options = {}) {
       try {
         const fileBuffer = fs.readFileSync(safe);
         const img = await Jimp.fromBuffer(fileBuffer);
-        img.cover({ w: profile.width, h: profile.height });
-        const png = await img.getBuffer('image/png');
+        const fitMode = safeFitMode((item && item.fit_mode) || options?.fitMode, options?.defaultFitMode || 'cover');
+        const bgColorHex = options?.backgroundColor || options?.device?.background_color;
+        const canvas = fitImageOntoCanvas(img, profile.width, profile.height, fitMode, bgColorHex);
+        const png = await canvas.getBuffer('image/png');
         return { png };
       } catch (e) {
         if (e.code === 'INVALID_PATH' || e.code === 'NOT_FOUND') throw e;
@@ -803,7 +821,7 @@ async function renderLayoutNative(layout, zoneEntries, screenProfile, options = 
     return za - zb;
   });
 
-  const bgColorHex = safeHexColor(options?.device?.background_color || options?.backgroundColor, '#000000');
+  const bgColorHex = safeHexColor(options?.backgroundColor || options?.device?.background_color, '#000000');
   const layoutBg = parseColorToRgba(bgColorHex, 0x000000FF);
   const canvas = new Jimp({ width: profile.width, height: profile.height, color: layoutBg });
 
@@ -874,14 +892,9 @@ async function renderLayoutNative(layout, zoneEntries, screenProfile, options = 
 
     if (img) {
       const fitMode = safeFitMode((entry.item && entry.item.fit_mode) || zone.fit_mode);
-      if (fitMode === 'cover') {
-        img.cover({ w: pixelW, h: pixelH });
-      } else if (fitMode === 'fill') {
-        img.resize({ w: pixelW, h: pixelH });
-      } else {
-        img.contain({ w: pixelW, h: pixelH });
-      }
-      canvas.composite(img, pixelX, pixelY);
+      const zoneBg = zone.background_color || options?.backgroundColor || options?.device?.background_color;
+      const zoneCanvas = fitImageOntoCanvas(img, pixelW, pixelH, fitMode, zoneBg);
+      canvas.composite(zoneCanvas, pixelX, pixelY);
     }
   }
 
@@ -1009,7 +1022,7 @@ async function renderLayout(layout, zoneEntries, screenProfile, options = {}) {
   }
 
   const baseUrl = localBaseUrl();
-  const compositeBg = safeHexColor(options?.device?.background_color || options?.backgroundColor, '#000000');
+  const compositeBg = safeHexColor(options?.backgroundColor || options?.device?.background_color, '#000000');
   const compositeHtml = `<!DOCTYPE html>
 <html>
 <head>
@@ -1060,6 +1073,9 @@ module.exports = {
   safeDimension,
   safeLocalImagePath,
   parseColorToRgba,
+  fitImageOntoCanvas,
+  safeHexColor,
+  safeFitMode,
   withTimeout,
   guardRasterRequests,
   safeZoneRemoteUrl,

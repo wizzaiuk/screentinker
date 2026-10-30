@@ -94,8 +94,9 @@ function capturePlaylist(db, row) {
   // which slot it could not bring back — and only where the column exists (hand-built fixtures).
   const hasSlots = require('./corporate/schema-probe').hasColumn(db, 'playlist_items', 'slot_id');
   const hasLayoutRef = require('./corporate/schema-probe').hasColumn(db, 'playlist_items', 'layout_ref_id');
+  const hasTransparentBg = require('./corporate/schema-probe').hasColumn(db, 'playlist_items', 'transparent_bg');
   const items = db.prepare(`SELECT pi.id, pi.content_id, pi.widget_id, pi.child_playlist_id, pi.zone_id, pi.sort_order, pi.duration_sec, pi.muted, pi.play_from, pi.play_until, pi.enabled, pi.log_play, pi.fit_mode, pi.play_when, pi.weight, pi.repeat_every_sec, pi.play_to_end
-                                   ${hasSlots ? ', pi.slot_id, (SELECT s.name FROM corporate_slots s WHERE s.id = pi.slot_id) AS slot_name' : ''}${hasLayoutRef ? ', pi.layout_ref_id' : ''}
+                                   ${hasSlots ? ', pi.slot_id, (SELECT s.name FROM corporate_slots s WHERE s.id = pi.slot_id) AS slot_name' : ''}${hasLayoutRef ? ', pi.layout_ref_id' : ''}${hasTransparentBg ? ', pi.transparent_bg' : ''}
                               FROM playlist_items pi WHERE pi.playlist_id = ? ORDER BY pi.sort_order ASC, pi.id ASC`).all(row.id)
     .map((it) => ({
       content_id: it.content_id || null, widget_id: it.widget_id || null, child_playlist_id: it.child_playlist_id || null,
@@ -106,6 +107,7 @@ function capturePlaylist(db, row) {
       // Only when set, so capturing an unchanged pre-feature playlist yields the same state as before.
       ...(it.repeat_every_sec ? { repeat_every_sec: it.repeat_every_sec } : {}),
       ...(it.play_to_end ? { play_to_end: 1 } : {}),
+      ...(it.transparent_bg ? { transparent_bg: 1 } : {}),   // #660, same rule
       ...(it.slot_id ? { slot_id: it.slot_id, slot_name: it.slot_name || null } : {}),
       // 3.0 campaigns: a layout item and its zones' playlists, only when set (same reason).
       ...(it.layout_ref_id ? { layout_ref_id: it.layout_ref_id, zone_sources: zoneSourcesOf(db, it.id) } : {}),
@@ -115,6 +117,7 @@ function capturePlaylist(db, row) {
   // 3.0 playlist layout: part of what a reviewer approves. Only when set, so an unchanged
   // pre-feature playlist captures the same state (and the same approval hash) as before.
   if (row.layout_id) state.layout_id = row.layout_id;
+  if (row.background_color) state.background_color = row.background_color;   // #660, same rule
   if (row.smart_rules) {
     state.smart_rules = row.smart_rules;
     // ⚠️ A smart playlist's items are what its rules match NOW, not playlist_items (it has none).
@@ -152,7 +155,7 @@ function captureDeck(db, row) {
 }
 
 const CONTENT_FIELDS = ['filename', 'mime_type', 'file_size', 'duration_sec', 'width', 'height', 'remote_url', 'subtitle_url',
-  'subtitle_lang', 'expires_at', 'folder_id', 'bundle_entry', 'byte_digest', 'captions_enabled', 'captions_lang', 'unstable_connection', 'tags', 'meta'];
+  'subtitle_lang', 'expires_at', 'folder_id', 'bundle_entry', 'byte_digest', 'captions_enabled', 'captions_lang', 'unstable_connection', 'tls_self_signed', 'fisheye', 'tags', 'meta'];
 /*
  * The fields a content DRAFT can carry and a release applies, in one place so that what a restore
  * writes into the draft and what publishing the draft copies to the live row cannot drift apart
@@ -162,7 +165,7 @@ const CONTENT_FIELDS = ['filename', 'mime_type', 'file_size', 'duration_sec', 'w
  */
 const CONTENT_DRAFT_FIELDS = CONTENT_FIELDS.filter((k) => k !== 'folder_id');
 /* Of those, the ones that change what a screen shows. Under approval, edits to these are drafts. */
-const CONTENT_PLAYBACK_FIELDS = ['remote_url', 'mime_type', 'subtitle_url', 'subtitle_lang', 'captions_enabled', 'captions_lang', 'unstable_connection'];
+const CONTENT_PLAYBACK_FIELDS = ['remote_url', 'mime_type', 'subtitle_url', 'subtitle_lang', 'captions_enabled', 'captions_lang', 'unstable_connection', 'tls_self_signed', 'fisheye'];
 function captureContent(db, row) {
   const draft = parseJson(row.draft_json, null);
   const src = draft ? { ...row, ...draft } : row;
@@ -221,6 +224,33 @@ function latest(db, type, id) {
   return db.prepare('SELECT * FROM revisions WHERE resource_type = ? AND resource_id = ? ORDER BY rev_no DESC LIMIT 1').get(type, id) || null;
 }
 
+/*
+ * A burst of the same edit by the same person folds into one revision. Clicking a duration
+ * spinner from 10 to 20 used to write ten revisions, and with retention keeping the newest
+ * REVISION_KEEP per resource that pushed the meaningful history out. The folded revision still
+ * names who did it and holds the final state; the window is fixed from the revision's
+ * created_at, so a long session still lands as several versions you can roll back to.
+ *
+ * Only an unpublished, non-baseline revision with no file change and no submission pointing at
+ * it is folded into: anything a release or a review refers to stays exactly as it was.
+ */
+const COALESCE_SEC = Math.max(0, parseInt(process.env.REVISION_COALESCE_SEC || '120', 10) || 0);
+
+function canCoalesce(db, prev, { actor, summary, fileRef, submissionId }) {
+  if (!COALESCE_SEC || !prev || !actor || !actor.userId) return false;
+  if (prev.published_at || prev.is_baseline || prev.submission_id || submissionId) return false;
+  if (prev.actor_user_id !== actor.userId || (prev.actor_kind || 'user') !== (actor.kind || 'user')) return false;
+  if (prev.summary !== String(summary || '').slice(0, 300)) return false;
+  if ((prev.file_ref || null) !== (fileRef || null)) return false;
+  if (nowSec() - prev.created_at > COALESCE_SEC) return false;
+  try {
+    if (db.prepare('SELECT 1 FROM submissions WHERE revision_id = ? LIMIT 1').get(prev.id)) return false;
+  } catch (e) {
+    if (!/no such table: submissions/.test(String(e && e.message))) throw e;
+  }
+  return true;
+}
+
 /**
  * Append a revision. Identical state to the latest revision (same hash, same file) records
  * nothing and returns the existing row: a Save that changed nothing is not a version.
@@ -231,6 +261,11 @@ function record(db, { type, id, workspaceId, actor = {}, summary = '', state, fi
   const hash = hashState(state);
   const prev = latest(db, type, id);
   if (!force && prev && prev.state_hash === hash && (prev.file_ref || null) === (fileRef || null) && !publishedAt) return prev;
+  if (!force && !publishedAt && !isBaseline && canCoalesce(db, prev, { actor, summary, fileRef, submissionId })) {
+    db.prepare('UPDATE revisions SET state = ?, state_hash = ?, thumb_ref = ? WHERE id = ?')
+      .run(JSON.stringify(state), hash, thumbRef || null, prev.id);
+    return { ...prev, state: JSON.stringify(state), state_hash: hash, thumb_ref: thumbRef || null };
+  }
   const rev = {
     id: uuid(), workspace_id: workspaceId || null, resource_type: type, resource_id: id,
     rev_no: prev ? prev.rev_no + 1 : 1, created_at: createdAt || nowSec(),
@@ -471,7 +506,7 @@ function fieldDiff(a, b, skip = new Set()) {
   return changed;
 }
 
-function listDiff(as, bs, keyOf, label) {
+function listDiff(as, bs, keyOf, label, skip = new Set()) {
   const ka = as.map(keyOf), kb = bs.map(keyOf);
   const setA = new Set(ka), setB = new Set(kb);
   const added = bs.filter((x, i) => !setA.has(kb[i])).map(label);
@@ -482,7 +517,7 @@ function listDiff(as, bs, keyOf, label) {
   const changed = [];
   for (const k of common) {
     const x = as[ka.indexOf(k)], y = bs[kb.indexOf(k)];
-    const d = fieldDiff(x, y);
+    const d = fieldDiff(x, y, skip);
     if (d.length) changed.push({ item: label(y), changes: d });
   }
   return { added, removed, reordered, changed };
@@ -493,7 +528,9 @@ function diffStates(type, a, b) {
   if (type === 'playlist') {
     const key = (it) => `${it.content_id || ''}|${it.widget_id || ''}|${it.child_playlist_id || ''}|${it.zone_id || ''}`;
     const label = (it) => ({ content_id: it.content_id, widget_id: it.widget_id, child_playlist_id: it.child_playlist_id, zone_id: it.zone_id, duration_sec: it.duration_sec });
-    return { fields: fieldDiff(a, b, new Set(['items'])), items: listDiff(a.items || [], b.items || [], key, label) };
+    // sort_order is the item's position: an insertion moves every later item's, and position is
+    // already reported as added / removed / reordered. Not a change to the item itself.
+    return { fields: fieldDiff(a, b, new Set(['items'])), items: listDiff(a.items || [], b.items || [], key, label, new Set(['sort_order'])) };
   }
   if (type === 'layout') {
     return { fields: fieldDiff(a, b, new Set(['zones'])), zones: listDiff(a.zones || [], b.zones || [], (z) => z.id, (z) => ({ id: z.id, name: z.name })) };
@@ -505,6 +542,35 @@ function diffStates(type, a, b) {
   }
   if (type === 'widget') return { fields: [...fieldDiff({ name: a.name }, { name: b.name }), ...fieldDiff(a.config || {}, b.config || {}).map((d) => ({ ...d, field: 'config.' + d.field }))] };
   return { fields: fieldDiff(a, b) };
+}
+
+/*
+ * A submitted state against the LIVE one (the Reviews page). captureLiveState rebuilds a playlist
+ * from its published snapshot, which records fewer fields than captureState (no enabled, weight,
+ * playback_order ...), and its item schedules are in the snapshot's {days,start,end} shape. Diffing
+ * the two raw marked every item "changed" whenever anything was added. Compare only what the live
+ * side records, with the schedules in one shape. captureLiveState itself is left alone: submit()
+ * hashes it.
+ */
+function scheduleShape(s) {
+  if (!s || typeof s !== 'object') return s;
+  const days = Array.isArray(s.days) ? s.days : String(s.active_days ?? '').split(',').filter((x) => x !== '').map(Number);
+  return { days, start: s.start ?? s.start_time ?? null, end: s.end ?? s.end_time ?? null, start_date: s.start_date || null, end_date: s.end_date || null };
+}
+function diffFromLive(type, live, state) {
+  if (type !== 'playlist' || !live || !state) return diffStates(type, live, state);
+  const pick = (o, keys) => { const out = {}; for (const k of keys) if (k in o) out[k] = o[k]; return out; };
+  const top = Object.keys(live).filter((k) => k !== 'items');
+  const itemKeys = new Set();
+  for (const it of live.items || []) for (const k of Object.keys(it)) itemKeys.add(k);
+  const shapeItem = (it) => {
+    const o = pick(it, itemKeys);
+    if (itemKeys.has('schedules')) o.schedules = (it.schedules || []).map(scheduleShape);
+    return o;
+  };
+  return diffStates(type,
+    { ...pick(live, top), items: (live.items || []).map(shapeItem) },
+    { ...pick(state, top), items: (state.items || []).map(shapeItem) });
 }
 
 // ─── restore: write an old state into the DRAFT and record it ────────────────────────────────
@@ -575,6 +641,7 @@ function restoreToDraft(db, { type, id, revisionId, actor, materialized = null }
           // 3.0 campaigns: a layout item whose layout is gone is not restored (nothing to show).
           if (it.layout_ref_id && !db.prepare('SELECT 1 FROM layouts WHERE id = ?').get(it.layout_ref_id)) continue;
           const r = ins.run(id, it.content_id || null, it.widget_id || null, it.child_playlist_id || null, it.zone_id || null, it.sort_order, it.duration_sec, it.muted ? 1 : 0, it.play_from || null, it.play_until || null, it.enabled === 0 ? 0 : 1, it.log_play === 0 ? 0 : 1, it.fit_mode || null, it.play_when || null, it.weight || 1, it.repeat_every_sec || null, it.play_to_end ? 1 : null, ...(hasSlots ? [it.slot_id || null] : []));
+          if (it.transparent_bg) db.prepare('UPDATE playlist_items SET transparent_bg = 1 WHERE id = ?').run(r.lastInsertRowid);   // #660
           if (it.layout_ref_id) {
             db.prepare('UPDATE playlist_items SET layout_ref_id = ? WHERE id = ?').run(it.layout_ref_id, r.lastInsertRowid);
             for (const [zid, pid] of Object.entries(it.zone_sources || {})) {
@@ -595,6 +662,9 @@ function restoreToDraft(db, { type, id, revisionId, actor, materialized = null }
       }
       db.prepare("UPDATE playlists SET name = ?, description = ?, playback_order = ?, smart_rules = ?, status = 'draft', updated_at = ? WHERE id = ?")
         .run(state.name || row.name, state.description || '', state.playback_order || row.playback_order || 'sequential', state.smart_rules || null, now, id);
+      if (require('./corporate/schema-probe').hasColumn(db, 'playlists', 'background_color')) {
+        db.prepare('UPDATE playlists SET background_color = ? WHERE id = ?').run(require('./backgrounds').normalizePlaylistBg(state.background_color), id);   // #660
+      }
       if (require('./corporate/schema-probe').hasColumn(db, 'playlists', 'layout_id')) {
         // A layout that has since been deleted (or now belongs elsewhere) is not restored.
         const l = state.layout_id ? db.prepare('SELECT is_template, workspace_id FROM layouts WHERE id = ?').get(state.layout_id) : null;
@@ -656,5 +726,5 @@ function lastPublished(db, type, id) {
 module.exports = { CONTENT_DRAFT_FIELDS, CONTENT_PLAYBACK_FIELDS, disposeDraftFiles,
   RESOURCE_TYPES, TABLE, HISTORY_DIR,
   captureState, captureLiveState, hashState, stable, record, recordCurrent, recordMissingIn, markPublished, baselineAll,
-  retainContentFile, resolveFileRef, refExists, materializeRefs, historyDir, deleteHistoryRows, removeRetainedFiles, redactState, diffStates, restoreToDraft, hasDraft, list, get, latest, lastPublished, parseJson,
+  retainContentFile, resolveFileRef, refExists, materializeRefs, historyDir, deleteHistoryRows, removeRetainedFiles, redactState, diffStates, diffFromLive, restoreToDraft, hasDraft, list, get, latest, lastPublished, parseJson,
 };

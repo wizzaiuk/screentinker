@@ -677,6 +677,19 @@ const migrations = [
   // embed at 720p (playerVars.vq='hd720') so weak/unstable WiFi on Android TV doesn't
   // buffer/stall on an auto-selected 1080p+ stream. DEFAULT 0 = no cap (today's behaviour).
   "ALTER TABLE content ADD COLUMN unstable_connection INTEGER NOT NULL DEFAULT 0",
+  // An rtsps:// camera with a self-signed certificate (UniFi Protect's default): the player skips
+  // the certificate check for this item only. DEFAULT 0 = verify, as every other TLS connection.
+  "ALTER TABLE content ADD COLUMN tls_self_signed INTEGER NOT NULL DEFAULT 0",
+  // A fisheye (360°) camera shown as a normal 16:9 view: JSON settings (lib/fisheye.js), NULL = show
+  // the picture as it comes.
+  "ALTER TABLE content ADD COLUMN fisheye TEXT",
+  // An ONVIF camera (lib/onvif): JSON {xaddr, username, profile_token, profile_name, ptz, via,
+  // services} so the server can refresh its stream address, fetch a snapshot and steer it. `via` is
+  // 'server' or the id of the screen that bridges the camera's network. The password is NOT in it:
+  // onvif_secret holds it encrypted (lib/secretbox.js) and it is never sent back to a browser.
+  // NULL = an ordinary stream.
+  "ALTER TABLE content ADD COLUMN onvif TEXT",
+  "ALTER TABLE content ADD COLUMN onvif_secret TEXT",
   // #216: subtitle/caption support as a content property (applied automatically by the
   // player, no in-player controls). YouTube uses captions_enabled + captions_lang (via the
   // IFrame API); uploaded videos use subtitle_url (a .vtt filename in the content dir,
@@ -3420,6 +3433,39 @@ const migrations = [
    * screen_share_max_presenters, 1-4).
    */
   'ALTER TABLE devices ADD COLUMN screen_share_multi INTEGER NOT NULL DEFAULT 0',
+  /*
+   * Scale-out: a replica that DIALS OUT to its primary (lib/mesh/dial-out.js, docs/scale-out.md
+   * "A replica behind NAT"). The primary mints an invite; the replica redeems it and keeps the
+   * connection open itself, so the primary never needs a route to the replica.
+   *
+   * mesh_edges.dial_token — the replica's plaintext edge token, ONLY on a `down` edge whose
+   *   transport_direction is 'we-dial'. Its own column for the same reason up_token is: a column
+   *   that is sometimes a secret and sometimes a hash is how one gets logged. The primary keeps
+   *   only the hash, in token_hash on its 'they-dial' `up` edge.
+   * mesh_invites — on the primary. The workspace scope is chosen at MINT time by the side giving
+   *   the data, exactly like a pairing code's grant; the redeemer cannot widen it. Burned in the
+   *   transaction that creates the edge, kept as the audit trail (never deleted).
+   */
+  'ALTER TABLE mesh_edges ADD COLUMN dial_token TEXT',
+  `CREATE TABLE IF NOT EXISTS mesh_invites (
+     id                TEXT PRIMARY KEY,
+     code              TEXT NOT NULL,
+     shared_workspaces TEXT,
+     grant_categories  TEXT NOT NULL DEFAULT '["workspace-replication"]',
+     created_by        TEXT,
+     created_at        INTEGER NOT NULL,
+     expires_at        INTEGER NOT NULL,
+     burned_at         INTEGER,
+     burned_by_node    TEXT
+   )`,
+  'CREATE INDEX IF NOT EXISTS idx_mesh_invites_code ON mesh_invites (code)',
+  // #724: per-device "mains powered, ignore battery" override. Some commercial TV boards report a
+  // battery as present with a fixed bogus level (e.g. 42%, charging) that the EXTRA_PRESENT check
+  // in the player cannot catch, because the board lies about presence. When this is set the server
+  // forces battery_level / battery_charging to null at telemetry ingest, so a batteryless panel
+  // reads as mains everywhere (dashboard and alerts) regardless of what the board claims. Off by
+  // default; the honest boards are handled by the player's EXTRA_PRESENT gate and need no switch.
+  "ALTER TABLE devices ADD COLUMN ignore_battery INTEGER NOT NULL DEFAULT 0",
 ];
 // Apply each ALTER idempotently. A "duplicate column name" / "already exists"
 // error means the column is already present (expected on a migrated DB) - benign.
@@ -4402,6 +4448,24 @@ migrationStep('smart playlists', () => {
   try { db.prepare('ALTER TABLE playlist_items ADD COLUMN play_to_end INTEGER').run(); console.log('[migrate] playlist_items.play_to_end added'); } catch (_) { /* present */ }
 });
 
+migrationStep('#660 playlist and item backgrounds', () => {
+  // A playlist's own background colour, painted behind what it shows in place of the device's
+  // background_color (lib/backgrounds.js). Hex; NULL = the screen's colour, as before. Published
+  // like playback_order: screens get published_background_color.
+  try { db.prepare('ALTER TABLE playlists ADD COLUMN background_color TEXT').run(); console.log('[migrate] playlists.background_color added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE playlists ADD COLUMN published_background_color TEXT').run(); } catch (_) { /* present */ }
+  // "Transparent background" on one item: its widget, bundle or template is drawn see-through.
+  // 1 or NULL; NULL = as the content itself sets it.
+  try { db.prepare('ALTER TABLE playlist_items ADD COLUMN transparent_bg INTEGER').run(); console.log('[migrate] playlist_items.transparent_bg added'); } catch (_) { /* present */ }
+});
+
+migrationStep('playlist default zone', () => {
+  // The zone of the playlist's layout that NEW items added without a zone are given
+  // (lib/playlist-layout.js zoneForNewItem). A setting, not published content: it is stored on each
+  // item as it is added, so existing items never move. NULL = no zone, as before.
+  try { db.prepare('ALTER TABLE playlists ADD COLUMN default_zone_id TEXT').run(); console.log('[migrate] playlists.default_zone_id added'); } catch (_) { /* present */ }
+});
+
 migrationStep('SAML', () => {
   // SAML 2.0 org providers (lib/saml.js). A SAML row keeps the IdP's entityID in `issuer` and an empty
   // client_id (both NOT NULL in the original table), so no rebuild is needed.
@@ -5103,6 +5167,58 @@ migrationStep('template-zone dedupe', () => {
     if (removed > 0) console.log(`[migrate] removed ${removed} duplicate template zone(s)`);
     db.prepare('INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)').run(DEDUPE_ID);
   }
+});
+
+migrationStep('#714 admin-only playlists', () => {
+  // #714: a workspace admin can lock a playlist so only admins (workspace_admin, or an org/platform
+  // admin acting-as) may edit, reorder or delete it — a content manager (workspace_editor) can still
+  // work on every other playlist. A setting, not published content, so there is no published_ mirror
+  // and nothing to send to a player: enforced server-side in routes/playlists.js (loadPlaylistAccess).
+  // 0 = anyone with write access may edit, as before.
+  try { db.prepare('ALTER TABLE playlists ADD COLUMN admin_locked INTEGER NOT NULL DEFAULT 0').run(); console.log('[migrate] playlists.admin_locked added'); } catch (_) { /* present */ }
+});
+
+migrationStep('web player offline-cache report', () => {
+  /*
+   * What a web player last reported about its offline cache (ws/deviceSocket.js 'cache-status'):
+   * JSON { wanted, ready, ready_bytes, partial, partial_bytes, usage, quota, persisted, error }.
+   * Shown on the device page so a screen that would go dark without its network is visible BEFORE
+   * the network goes (an LG webOS panel whose cache never filled, 2026-10-30). NULL = never reported.
+   */
+  try { db.prepare('ALTER TABLE devices ADD COLUMN offline_cache TEXT').run(); console.log('[migrate] devices.offline_cache added'); } catch (_) { /* present */ }
+  try { db.prepare('ALTER TABLE devices ADD COLUMN offline_cache_at INTEGER').run(); } catch (_) { /* present */ }
+});
+
+migrationStep('#720 device Wi-Fi networks', () => {
+  /*
+   * #720: the Wi-Fi networks a screen should know (lib/device-wifi.js). Its own table on purpose, not
+   * devices columns: those reach every SELECT * of a device, PUT /devices/:id, exports, mesh replicas,
+   * API tokens and the MCP tools. psk_enc is the password through lib/secretbox, never returned.
+   * status is what the player last reported for the network (device:wifi-result), or what the server
+   * knows itself ('pending', 'sent', 'not_delivered').
+   */
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_wifi_networks (
+      id             TEXT PRIMARY KEY,
+      workspace_id   TEXT NOT NULL,
+      device_id      TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      ssid           TEXT NOT NULL,
+      security       TEXT NOT NULL DEFAULT 'wpa2',
+      hidden         INTEGER NOT NULL DEFAULT 0,
+      priority       INTEGER,
+      psk_enc        TEXT,
+      status         TEXT NOT NULL DEFAULT 'pending',
+      status_reason  TEXT,
+      status_at      INTEGER,
+      created_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      updated_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+      UNIQUE (device_id, ssid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_device_wifi_networks_ws ON device_wifi_networks (workspace_id);
+  `);
+  // What the player can do with them, from device_info (owner / direct / suggestions / unsupported).
+  // NULL = an older or non-Android player, about which the dashboard says nothing. capture_mode style.
+  try { db.prepare('ALTER TABLE devices ADD COLUMN wifi_mode TEXT').run(); console.log('[migrate] devices.wifi_mode added'); } catch (_) { /* present */ }
 });
 
 /*

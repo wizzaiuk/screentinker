@@ -70,7 +70,7 @@ db.exec(`
     -- COALESCE(NULLIF(updated_at,0), created_at) inside a bare catch, so a fixture without this
     -- column made that whole refresh branch throw and be swallowed, silently untested.
     created_at INTEGER NOT NULL DEFAULT 0,
-    expires_at INTEGER, unstable_connection INTEGER DEFAULT 0,
+    expires_at INTEGER, unstable_connection INTEGER DEFAULT 0, tls_self_signed INTEGER DEFAULT 0, fisheye TEXT,
     captions_enabled INTEGER DEFAULT 0, captions_lang TEXT, subtitle_url TEXT, subtitle_lang TEXT,
     tags TEXT, meta TEXT
   );
@@ -765,6 +765,8 @@ describe('Embedded HTTP Route & Fallback Handling', () => {
     });
     assert.equal(res.status, 304);
     assert.equal(res.headers.get('x-st-power-state'), 'scheduled_off');
+    assert.equal(res.headers.get('x-st-color-mode'), '1bit');
+    assert.equal(res.headers.get('x-st-refresh-mode'), 'partial');
     assert.equal(res.headers.get('x-st-expires-in'), '3600');
     assert.equal(res.headers.get('x-st-device-id'), devId);
 
@@ -1073,13 +1075,16 @@ describe('Issue #337 Follow-ups: Robustness, Parity & Deduplication', () => {
   } = require('../lib/embedded-render');
   const { parseProfile } = require('../lib/embedded-profiles');
 
-  test('parseProfile enforces 10000 dimension ceiling', () => {
+  // Was a 10000×10000 ceiling, ~400 MB per render on a shared server; now at most a 4K panel
+  // (test/embedded-profile-size-cap.test.js covers the limits in full).
+  test('parseProfile enforces the dimension ceiling', () => {
     assert.equal(parseProfile({ width: 10001, height: 480 }), null);
     assert.equal(parseProfile({ width: 800, height: 10001 }), null);
-    const valid = parseProfile({ width: 10000, height: 10000 });
+    assert.equal(parseProfile({ width: 10000, height: 10000 }), null);
+    const valid = parseProfile({ width: 3840, height: 2160 });
     assert.ok(valid);
-    assert.equal(valid.width, 10000);
-    assert.equal(valid.height, 10000);
+    assert.equal(valid.width, 3840);
+    assert.equal(valid.height, 2160);
     assert.equal(safeDimension(10001, 800), 800);
     assert.equal(safeDimension(500, 800), 500);
   });

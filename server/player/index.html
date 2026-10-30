@@ -277,7 +277,7 @@
 <body>
   <!-- Setup Screen -->
   <div id="setupScreen">
-    <h1>ScreenTinker</h1>
+    <h1 data-brand>ScreenTinker</h1>
     <div class="subtitle">Web Player</div>
     <div class="form" id="urlForm">
       <label>Server URL</label>
@@ -312,7 +312,7 @@
   <!-- Status Overlay -->
   <div id="statusOverlay" style="display:none">
     <div class="spinner"></div>
-    <h2>ScreenTinker</h2>
+    <h2 data-brand>ScreenTinker</h2>
     <p id="statusText" data-i18n="connecting">Connecting...</p>
   </div>
 
@@ -599,6 +599,49 @@
       return '::' + h(2166136261) + h(0x9747b28c);
     }
     const LINK_SUFFIX = VIEWER_MODE ? '' : linkStorageSuffix(urlEnrolKey());
+    /*
+     * #674: the brand this screen shows, as { name, hidden }. The server stamps the brand its hostname
+     * resolves to into the markup and into __playerConfig.brand; device:paired then carries the paired
+     * workspace's own brand, cached here so a reboot paints it before the socket is up. hidden = show
+     * no product name at all (the instance hides platform branding and never renamed itself).
+     */
+    const BRAND_KEY = 'st_brand' + LINK_SUFFIX;
+    function servedBrand() {
+      const b = window.__playerConfig && window.__playerConfig.brand;
+      return (b && typeof b.name === 'string') ? { name: b.name, hidden: !!b.hidden } : { name: 'ScreenTinker', hidden: false };
+    }
+    let playerBrand = (() => {
+      try {
+        const c = JSON.parse(localStorage.getItem(BRAND_KEY) || 'null');
+        if (c && typeof c.name === 'string') return { name: c.name, hidden: !!c.hidden };
+      } catch (e) {}
+      return servedBrand();
+    })();
+    // "<brand> Web Player" in the screen's language; just "Web Player" when the brand is hidden.
+    function brandTitle() {
+      if (playerBrand.hidden || !playerBrand.name) return _t('web_player');
+      return _t('info_title').replace('ScreenTinker', playerBrand.name);
+    }
+    // Paints the current brand everywhere it shows. Text only (textContent), never markup.
+    function applyBrand(b) {
+      if (b && typeof b.name === 'string') {
+        playerBrand = { name: b.name, hidden: !!b.hidden };
+        try { localStorage.setItem(BRAND_KEY, JSON.stringify(playerBrand)); } catch (e) {}
+      }
+      document.title = playerBrand.name ? playerBrand.name + ' Player' : 'Player';
+      document.querySelectorAll('[data-brand]').forEach((el) => {
+        el.textContent = playerBrand.name;
+        el.style.display = playerBrand.name ? '' : 'none';
+      });
+      document.querySelectorAll('[data-brand-title]').forEach((el) => { el.textContent = brandTitle(); });
+    }
+    // Unpaired: the workspace brand no longer applies; back to what this hostname serves.
+    function forgetBrand() {
+      try { localStorage.removeItem(BRAND_KEY); } catch (e) {}
+      playerBrand = servedBrand();
+      applyBrand();
+    }
+    applyBrand();
     const SCREEN_SUFFIX = VIEWER_MODE ? '__view' : (() => {
       try { return BS ? (BS.storageSuffix() || '') : ''; } catch (e) { return ''; }
     })() + LINK_SUFFIX;
@@ -1011,6 +1054,58 @@
         sw.postMessage({ type: 'st-site-cache', config: cfg, scope: SCREEN_SUFFIX });
       } catch (e) { /* never let the cache hint break playback */ }
     }
+    /*
+     * How ready this screen is to play with the network gone, reported to the server (device page,
+     * "Offline cache"): how many of its media files are fully cached, the bytes, the browser's quota
+     * and the last thing that stopped the cache from filling. Without it a screen whose cache never
+     * filled looked exactly like a healthy one until the network dropped and it went black (an LG
+     * webOS panel whose quota could not hold the old double-size download, 2026-10-30).
+     *
+     * Sent after each pin (once the prefetch has had a moment) and every OFFLINE_REPORT_EVERY_MS,
+     * only when something changed. Best effort: no worker, no report, playback untouched.
+     */
+    // ⚠️ var, not let/const: requestOfflineCache can run before this line has (the 1.9.32 boot brick
+    // was exactly a let read in its temporal dead zone). Hoisted, an early call sees undefined/null.
+    var OFFLINE_REPORT_AFTER_PIN_MS = 30000;
+    var OFFLINE_REPORT_EVERY_MS = 10 * 60 * 1000;
+    var offlineCacheUrls = null;
+    var offlineReportTimer = null;
+    var lastOfflineReport = '';
+    var storagePersisted = null;   // navigator.storage.persist(): true / false, null = not asked or no API
+    function scheduleOfflineCacheReport(ms) {
+      if (offlineReportTimer) clearTimeout(offlineReportTimer);
+      offlineReportTimer = setTimeout(() => {   // ms undefined (called before the vars above ran) = soon
+        offlineReportTimer = null;
+        reportOfflineCache();
+        scheduleOfflineCacheReport(OFFLINE_REPORT_EVERY_MS);
+      }, ms);
+    }
+    function reportOfflineCache() {
+      try {
+        const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+        if (!sw || !Array.isArray(offlineCacheUrls) || typeof MessageChannel !== 'function') return;
+        const ch = new MessageChannel();
+        const timer = setTimeout(() => { try { ch.port1.close(); } catch (e) {} }, 15000);
+        ch.port1.onmessage = (e) => {
+          clearTimeout(timer);
+          try { ch.port1.close(); } catch (err) {}
+          const s = e.data;
+          if (!s || typeof s !== 'object' || s.error && typeof s.error === 'string') return;
+          const report = {
+            wanted: s.wanted, ready: s.ready, ready_bytes: s.ready_bytes, partial: s.partial, partial_bytes: s.partial_bytes,
+            usage: s.usage, quota: s.quota, persisted: storagePersisted,
+            error: s.error && s.error.name ? s.error.name : null,
+          };
+          const sig = JSON.stringify(report);
+          if (sig === lastOfflineReport || !socket || !socket.connected || !config.deviceId) return;
+          lastOfflineReport = sig;
+          socket.emit('device:cache-status', { device_id: config.deviceId, ...report });
+          if (s.error && s.error.name) console.warn('[cache] ' + s.ready + '/' + s.wanted + ' offline-ready; last error: ' + s.error.name + ' ' + (s.error.message || ''));
+        };
+        sw.postMessage({ type: 'st-cache-status', urls: offlineCacheUrls }, [ch.port2]);
+      } catch (e) { /* never let the report touch playback */ }
+    }
+
     function requestOfflineCache(items, extraItems) {
       try {
         const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
@@ -1029,6 +1124,8 @@
         // a new randomly-named file, so the old copy is not merely a different revision of the same
         // URL — it is a different URL entirely, and nothing keyed on the asset path can find it.
         sw.postMessage({ type: 'st-cache-playlist', urls, prune: true, scope: SCREEN_SUFFIX });
+        offlineCacheUrls = urls;
+        scheduleOfflineCacheReport(OFFLINE_REPORT_AFTER_PIN_MS);
 
         /*
          * ⚠️ AND WARM EACH BUNDLE'S RENDER, because the archive alone is not playable.
@@ -1045,7 +1142,7 @@
          */
         for (const it of all) {
           if (!it || it.mime_type !== BUNDLE_MIME || !it.content_id) continue;
-          fetch(`${config.serverUrl}/api/content/${it.content_id}/bundle?rev=${it.content_rev || 0}`,
+          fetch(`${config.serverUrl}/api/content/${it.content_id}/bundle?rev=${it.content_rev || 0}${it.transparent_bg ? '&transparent=1' : ''}`,
             { credentials: 'omit' }).catch(() => {});
         }
       } catch (e) { /* never let caching break playback */ }
@@ -1828,9 +1925,18 @@
     // data every WIDGET_SOLO_REFRESH_MS — decoupled from duration_sec, because a static
     // board re-querying the DB + re-rendering every few seconds, fleet-wide, is pure waste.
     /* How long a single-item playlist waits before retrying an item it cannot render. In a
-     * multi-item playlist an unknown type advances immediately; alone there is nothing to advance
-     * to, so it must not spin. */
+     * multi-item playlist an unknown type advances immediately when another item can play; alone
+     * (or among items that cannot play either) there is nothing to advance to, so it must not spin. */
     const UNKNOWN_ITEM_HOLD_MS = 15000;
+    // The types renderContent knows how to put on screen; anything else is skipped (see there).
+    function isRenderableItem(item) {
+      return !!(item && (
+        item.widget_id ||
+        item.mime_type === BUNDLE_MIME ||
+        item.mime_type === 'video/youtube' ||
+        (typeof item.mime_type === 'string' && (item.mime_type.startsWith('video/') || item.mime_type.startsWith('image/')))
+      ));
+    }
     /* The mime lib/html-bundle.js stamps on an uploaded HTML bundle. Deliberately matches no
      * image/ or video/ prefix, so nothing routes it as media by accident. */
     const BUNDLE_MIME = 'application/vnd.screentinker.bundle+zip';
@@ -2846,7 +2952,7 @@
         const tapOverlay = document.createElement('div');
         tapOverlay.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;background:#111827;z-index:2000;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer';
         tapOverlay.innerHTML = `
-          <h1 style="color:#3b82f6;font-size:3.6rem;font-family:sans-serif;margin-bottom:1.2rem">ScreenTinker</h1>
+          <h1 data-brand style="color:#3b82f6;font-size:3.6rem;font-family:sans-serif;margin-bottom:1.2rem"></h1>
           <p style="color:#94a3b8;font-size:1.8rem;font-family:sans-serif">Tap anywhere to start</p>
           <p style="color:#64748b;font-size:1.3rem;font-family:sans-serif;margin-top:2.4rem">Audio requires user interaction</p>
         `;
@@ -2857,6 +2963,7 @@
           connect(config.serverUrl);
         };
         document.body.appendChild(tapOverlay);
+        applyBrand();   // #674: fills the heading above (text only)
 
         // Auto-dismiss after 5 seconds if no interaction (plays muted)
         setTimeout(() => {
@@ -3581,6 +3688,8 @@
          * feature being broken.
          */
         if (data && data.settings_pin) config.settingsPin = String(data.settings_pin);
+        // #674: the paired workspace's brand. Absent (older server, replica path) = keep what we show.
+        if (data && data.brand) applyBrand(data.brand);
         saveConfig(config);
         console.log('Paired as:', data.name);
         document.getElementById('setupScreen').style.display = 'none';
@@ -3597,7 +3706,8 @@
         const showIdle = (PMH && typeof PMH.shouldShowIdle === 'function')
           ? PMH.shouldShowIdle({ isPlaying: isPlaying, hasContent: playlist.length > 0 })
           : !isPlaying;
-        if (showIdle) showStatus('Waiting for content...');
+        // The device default image IS the idle screen when one is set; the card would cover it.
+        if (showIdle && !renderDefaultContent()) showStatus('Waiting for content...');
       });
 
       // Server no longer accepts our identity (row deleted, or token rejected). Drop the
@@ -3626,6 +3736,7 @@
 
       function enterRepairMode(message) {
         clearShareForUnpaired();
+        forgetBrand();   // #674
         delete config.deviceId;
         delete config.deviceToken;
         config.paired = false;
@@ -5282,6 +5393,33 @@
     // covers unconditionally, so a partial device_info does not "patch" a row — it nulls
     // android_version and the screen dimensions and resets ota_status/tier/the flag columns.
     // device:register and device:info both land there, so both must send the full thing.
+    // The surface this player draws on, in device pixels: what the wall editor sizes a fresh tile
+    // from (render_width/render_height, the same fields Android, the native player and Roku send).
+    // Without it every web-player panel -- browser, Tizen, webOS, BrightSign, Vega -- came out as the
+    // editor's 320x180 placeholder. A CSS quarter-turn lays the stage out sideways, so portrait
+    // swaps the two, as Android's rotated surface does. A host-rotated output (BrightSign) already
+    // turns the viewport itself, so there is nothing to swap.
+    function renderSize() {
+      const dpr = window.devicePixelRatio || 1;
+      let w = Math.round((window.innerWidth || 0) * dpr), h = Math.round((window.innerHeight || 0) * dpr);
+      if (cssQuarterTurn === 90 || cssQuarterTurn === 270) { const t = w; w = h; h = t; }
+      return w > 0 && h > 0 ? { w, h } : null;
+    }
+    let reportedRenderKey = '';
+    // Re-send device:info when the drawn size changes after registration (an orientation change,
+    // a resized browser window). Same full blob as register, per the warning below.
+    function maybeReportRenderSize() {
+      const r = renderSize();
+      const key = r ? r.w + 'x' + r.h : '';
+      if (!key || key === reportedRenderKey || !socket || !socket.connected || !config.deviceId) return;
+      socket.emit('device:info', { device_id: config.deviceId, device_info: buildDeviceInfo() });
+    }
+    let renderSizeTimer = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(renderSizeTimer);
+      renderSizeTimer = setTimeout(maybeReportRenderSize, 2000);
+    });
+
     function buildDeviceInfo() {
       const info = {
         android_version: 'Web/' + navigator.userAgent.split(' ').pop(),
@@ -5295,6 +5433,8 @@
         screen_width: screen.width,
         screen_height: screen.height,
       };
+      const r = renderSize();
+      if (r) { info.render_width = r.w; info.render_height = r.h; reportedRenderKey = r.w + 'x' + r.h; }
       // Additive. applyDeviceInfo ignores unknown keys; applyHardwareIdentity reads these and
       // leaves a column alone when the key is absent, so a browser register does not wipe a
       // model that a previous Vega register stored... it can't, a browser has a different row.
@@ -5964,6 +6104,21 @@
       }
       // Check if device is suspended (trial expired / over limit)
       if (data.suspended) {
+        /*
+         * ⚠️ STOP what was playing, not just hide it. A reloaded screen starts its cached playlist
+         * before the server answers, so the suspension lands mid-item. Only emptying `playlist` left
+         * that item's advance timer (and any idle re-check) armed: it fired seconds later, found no
+         * items and painted "Nothing scheduled right now" over this card, so an over-limit screen
+         * never said why it was dark. Same for a campaign's step timer.
+         */
+        teardownCurrentMedia();
+        stopSlideVo();
+        stopSlideBed();
+        clearTimeout(scheduleRetryTimer);
+        clearLookahead();
+        deferredRotation = false;
+        if (deferredRotationDeadline) { clearTimeout(deferredRotationDeadline); deferredRotationDeadline = null; }
+        if (campaign) stopCampaign();
         isPlaying = false;
         playlist = [];
         document.getElementById('playerContainer').style.display = 'none';
@@ -6003,7 +6158,7 @@
       // widget_rev is in here for the same reason as schedules and transition: a widget's IDENTITY
       // does not change when it is EDITED, so a content edit produced an identical fingerprint, the
       // update was treated as "unchanged", and the screen kept the old render until a reload.
-      const fingerprint = (items) => items.map(a => `${a.content_id || ''}|${a.widget_id || ''}|${a.widget_rev || ''}|${a.zone_id || ''}|${a.remote_url || ''}|${a.filepath || ''}|${a.filename || ''}|${JSON.stringify(a.schedules || [])}|${a.play_from || ''}|${a.play_until || ''}|${a.enabled === 0 ? 0 : 1}|${a.log_play === 0 ? 0 : 1}|${a.fit_mode || ''}|${JSON.stringify(a.play_when || null)}|${JSON.stringify(a.tags || [])}|${JSON.stringify(a.meta || {})}|${JSON.stringify(a.transition || null)}`).join(',');
+      const fingerprint = (items) => items.map(a => `${a.content_id || ''}|${a.widget_id || ''}|${a.widget_rev || ''}|${a.zone_id || ''}|${a.remote_url || ''}|${a.filepath || ''}|${a.filename || ''}|${JSON.stringify(a.schedules || [])}|${a.play_from || ''}|${a.play_until || ''}|${a.enabled === 0 ? 0 : 1}|${a.log_play === 0 ? 0 : 1}|${a.fit_mode || ''}|${JSON.stringify(a.play_when || null)}|${JSON.stringify(a.tags || [])}|${JSON.stringify(a.meta || {})}|${JSON.stringify(a.transition || null)}${a.transparent_bg ? '|t' : ''}`).join(',');
       const newFp = fingerprint(newItems);
       const oldFp = fingerprint(playlist);
 
@@ -6027,10 +6182,13 @@
       // #325: the letterbox colour behind content that does not fill the frame. Applied before
       // orientation so a rotation reflow does not flash the old colour. An absent value leaves the
       // stylesheet's black exactly as it was.
-      if (data.background_color && /^#[0-9a-fA-F]{3,8}$/.test(data.background_color)) {
+      // #660: it can now be a playlist's own colour, so an absent value also CLEARS a colour an
+      // earlier payload set: a screen that moves off that playlist goes back to its own colour.
+      {
+        const bg = data.background_color && /^#[0-9a-fA-F]{3,8}$/.test(data.background_color) ? data.background_color : '';
         const stage = document.getElementById('playerContainer');
-        if (stage) stage.style.background = data.background_color;
-        document.body.style.background = data.background_color;
+        if (stage) stage.style.background = bg;
+        document.body.style.background = bg;
       }
       // Device default/standby content (top-level, like background_color). If the currently-shown
       // idle default changed, drop the marker so the idle path re-mounts the new one.
@@ -6083,6 +6241,7 @@
               el.style.left = st.left;
             });
         }
+        maybeReportRenderSize();
       }
 
       // Apply (or clear) wall mode. Force re-render when wall config changes
@@ -6322,6 +6481,31 @@
 
       document.getElementById('setupScreen').style.display = 'none';
 
+      /*
+       * #725: a multi-zone layout renders each zone from `playlist` on its OWN timer, and the
+       * single-anchor continuity below only ever re-renders the anchor item's zone (the fullscreen
+       * model it was written for). A change confined to ANOTHER zone — the common case of a nested
+       * slide deck sitting in one zone whose slide was edited, but equally an item added to or
+       * removed from any non-anchor zone — landed in `playlist` but never reached the screen: the
+       * anchor "survives" (its id is unchanged), control falls to the plain `return` below, and the
+       * live zone timers keep rotating the item arrays they captured at the last full render, until a
+       * manual Reload Player rebuilds everything. We are here ONLY because the structural fingerprint
+       * changed (duration / mute / caption noise is synced in place above and never reaches this
+       * branch), so rebuild the zone stage from the new `playlist` exactly as a reload would. This is
+       * deliberately a whole-stage redraw (zones restart from their first item) rather than a
+       * per-zone patch: it is the same correct result the Reload Player button produces, and it
+       * avoids reusing the fullscreen continuity for a layout it does not fit. Walls own their own
+       * sync (wall:sync / renderWallZones), so they are excluded.
+       */
+      if (layout && layout.zones && layout.zones.length > 1 && !wallConfig) {
+        console.log('Playlist changed in a multi-zone layout - re-rendering all zones (#725)');
+        const survivor = playlist.findIndex(x => identityOf(x) === oldAnchorId);
+        currentIndex = survivor !== -1 ? survivor : 0;
+        isPlaying = true;
+        renderContent(playlist[currentIndex]);
+        return;
+      }
+
       // Continuity: if the playing item survives the update, keep playing it.
       // Just retarget the index pointer - no re-render, no interrupt. It will
       // advance naturally via onended -> nextItem.
@@ -6483,7 +6667,10 @@
       if (!dc || typeof dc.mime_type !== 'string' || !dc.mime_type.startsWith('image/')) return false;
       const container = document.getElementById('playerContainer');
       const key = dc.content_rev || dc.content_id || dc.remote_url || dc.filepath;
-      if (_defaultShownRev === key && container && container.querySelector('img[data-st-default]')) return true;
+      // ⚠️ #statusOverlay (z-index 500) sits ABOVE #playerContainer, so mounting the image is not
+      // enough: an idle card left up by an earlier path ("Waiting for content...", device:paired)
+      // covered it, and the default image was never seen. Every true return hides the card.
+      if (_defaultShownRev === key && container && container.querySelector('img[data-st-default]')) { hideStatus(); return true; }
       teardownCurrentMedia();
       const img = document.createElement('img');
       img.setAttribute('data-st-default', '1');
@@ -6492,6 +6679,7 @@
       img.src = mediaUrl(dc);
       if (container) { container.style.display = 'block'; container.appendChild(img); }
       _defaultShownRev = key;
+      hideStatus();
       return true;
     }
     // Every item filtered out: show the device default image (LED-wall off-times) or the idle screen,
@@ -6673,12 +6861,20 @@
      */
     function createYoutubeEmbed(src, item, container, opts) {
       const zoneMode = !!(opts && opts.zone);
-      const done = zoneMode ? (opts.onEnded || null) : nextItem;
+      // A wall FOLLOWER takes its playlist index only from the leader's wall:sync; a synced GROUP
+      // member derives it from the shared clock. Neither may self-advance when its YouTube ENDS or
+      // the #215 safety net fires — it would diverge from the others and the next sync snaps it back
+      // by re-mounting the item, which looks exactly like the video restarting (every ~10s on a
+      // follower, where getDuration() is often 0 so the net falls back to duration_sec). The <video>
+      // path is already gated this way (the fullscreen advance timer returns early for a follower /
+      // group member; follower videos render with mayAdvance false), so match it for YouTube here.
+      const syncFollower = !zoneMode && (((typeof isWallFollower === 'function') && isWallFollower()) || (typeof groupSync !== 'undefined' && !!groupSync));
+      const done = zoneMode ? (opts.onEnded || null) : (syncFollower ? null : nextItem);
       const videoId = extractVideoId(src);
       if (!videoId) {
         console.error('Could not extract YouTube video ID from:', src);
         if (zoneMode) { if (done) setTimeout(done, 2000); }
-        else if (playlist.length > 1) setTimeout(nextItem, 2000);
+        else if (playlist.length > 1 && !syncFollower) setTimeout(nextItem, 2000);
         return null;
       }
 
@@ -6716,11 +6912,11 @@
       // Create a div for the YT player to replace
       const playerDiv = document.createElement('div');
       playerDiv.id = 'yt-player-' + Date.now();
-      playerDiv.style.cssText = 'width:100%;height:100%;background:#000';
+      playerDiv.style.cssText = 'width:100%;height:100%;background:transparent';
       let mountEl = playerDiv;
       if (isVertical) {
         const wrap = document.createElement('div');
-        wrap.style.cssText = 'width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center';
+        wrap.style.cssText = 'width:100%;height:100%;background:transparent;display:flex;align-items:center;justify-content:center';   // #660: the pillarbox shows the screen's background
         const inner = document.createElement('div');
         inner.style.cssText = 'width:56.25vh;height:100%;max-width:100%';
         inner.appendChild(playerDiv);
@@ -6825,7 +7021,7 @@
               console.error('YouTube error', event.data, 'for:', item.filename);
               if (zoneMode) {
                 if (done) setTimeout(() => { if (alive()) done(); }, 2000);
-              } else if (playlist.length > 1) {
+              } else if (playlist.length > 1 && !syncFollower) {
                 console.log('Skipping unplayable YouTube video');
                 setTimeout(nextItem, 2000);
               }
@@ -6960,10 +7156,10 @@
       discardPendingSwap();
 
       const iframe = document.createElement('iframe');
-      iframe.src = `${config.serverUrl}/api/widgets/${item.widget_id}/render?device=${encodeURIComponent(config.deviceId||'')}&rev=${item.widget_rev||0}${item.widget_panel ? '#panel=' + encodeURIComponent(item.widget_panel) : ''}`;
-      // Positioned + sized by the `#playerContainer > iframe` CSS rule. Hidden while it
-      // loads so its black background never shows over the outgoing content.
-      iframe.style.background = '#000';
+      iframe.src = `${config.serverUrl}/api/widgets/${item.widget_id}/render?device=${encodeURIComponent(config.deviceId||'')}&rev=${item.widget_rev||0}${item.transparent_bg ? '&transparent=1' : ''}${item.widget_panel ? '#panel=' + encodeURIComponent(item.widget_panel) : ''}`;
+      // Positioned + sized by the `#playerContainer > iframe` CSS rule. Hidden while it loads, so
+      // the outgoing content stays up until it is ready. No background of its own (#660): a
+      // see-through widget shows the screen's background colour, the way it does in a zone.
       iframe.style.visibility = 'hidden';
       iframe.allow = 'autoplay; fullscreen';
       // Sandbox into a unique origin so widget scripts can't read window.parent state.
@@ -7019,8 +7215,7 @@
       discardPendingSwap();
 
       const iframe = document.createElement('iframe');
-      iframe.style.background = '#000';
-      iframe.style.visibility = 'hidden';
+      iframe.style.visibility = 'hidden';   // no background of its own (#660), as for a widget
       iframe.allow = 'autoplay; fullscreen';
       iframe.setAttribute('sandbox', 'allow-scripts');
 
@@ -7065,7 +7260,7 @@
        * why the dashboard's own preview navigates to an ephemeral URL instead of reusing this
        * trick, and why moving this mount to any page that has a CSP would break it invisibly.
        */
-      const url = `${config.serverUrl}/api/content/${item.content_id}/bundle?rev=${item.content_rev || 0}`;
+      const url = `${config.serverUrl}/api/content/${item.content_id}/bundle?rev=${item.content_rev || 0}${item.transparent_bg ? '&transparent=1' : ''}`;
       fetch(url, { credentials: 'omit' })
         .then((r) => (r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status))))
         .then((html) => { iframe.srcdoc = html; })
@@ -7912,12 +8107,7 @@
 
       // Defense in depth: bail to waiting state on missing/malformed item rather
       // than fall through every branch and leave a blank container.
-      const hasRenderableType = item && (
-        item.widget_id ||
-        item.mime_type === BUNDLE_MIME ||
-        item.mime_type === 'video/youtube' ||
-        (typeof item.mime_type === 'string' && (item.mime_type.startsWith('video/') || item.mime_type.startsWith('image/')))
-      );
+      const hasRenderableType = isRenderableItem(item);
       if (!hasRenderableType) {
         /*
          * ⚠️ THIS USED TO RETURN WITHOUT ARMING ANYTHING, AND THAT STOPPED THE PLAYLIST DEAD.
@@ -7930,11 +8120,12 @@
          * body with no validation. An unknown type must be a SKIPPED ITEM, never a stopped playlist.
          *
          * A single-item playlist still holds (there is nothing to advance to), so it retries slowly
-         * rather than spinning.
+         * rather than spinning. So does a playlist where NO item is renderable: "advance at once"
+         * there was a 0 ms loop through the same dead items, a play_start each time, for ever.
          */
         showStatus('Waiting for content...');
         isPlaying = false;
-        const onlyItem = !playlist || playlist.length <= 1;
+        const onlyItem = !playlist || playlist.length <= 1 || !playlist.some((p) => p !== item && isRenderableItem(p));
         console.log('[player] skipping item with unrecognised type:', item && item.mime_type);
         scheduleAdvance(nextItem, onlyItem ? UNKNOWN_ITEM_HOLD_MS : 0);
         return;
@@ -8047,7 +8238,7 @@
           if (!isFollower) scheduleAdvance(nextItem, (item.duration_sec || 10) * 1000);
         } else if (item.widget_id) {
           const iframe = document.createElement('iframe');
-          iframe.src = `${serverUrl}/api/widgets/${item.widget_id}/render?device=${encodeURIComponent(config.deviceId||'')}&rev=${item.widget_rev||0}${item.widget_panel ? '#panel=' + encodeURIComponent(item.widget_panel) : ''}`;
+          iframe.src = `${serverUrl}/api/widgets/${item.widget_id}/render?device=${encodeURIComponent(config.deviceId||'')}&rev=${item.widget_rev||0}${item.transparent_bg ? '&transparent=1' : ''}${item.widget_panel ? '#panel=' + encodeURIComponent(item.widget_panel) : ''}`;
           iframe.style.cssText = 'width:100%;height:100%;border:none;background:transparent';   // #336: a widget paints its own background
           iframe.allow = 'autoplay; fullscreen';
           // Sandbox into a unique origin so widget scripts can't read window.parent
@@ -8270,14 +8461,24 @@
         renderPreviewBanner();
       }
 
+      /*
+       * #666: a zone with nothing of its own stays EMPTY. It used to be filled with the current item
+       * (defaultItem), so the same content showed in every empty zone, which the Android, Tizen,
+       * native and Roku players never did. defaultItem is used only when NO zone has anything at
+       * all, so a layout can still never blank the whole screen; it goes where zone-less items go.
+       */
       let unassignedUsed = false;
-      layout.zones.forEach(zone => {
+      const zoneItems = layout.zones.map(zone => {
         let items = byZone[zone.id];
         if ((!items || !items.length) && !unassignedUsed && byZone['__none__']) {
           unassignedUsed = true; items = byZone['__none__'];
         }
-        if ((!items || !items.length) && defaultItem) items = [defaultItem];
-        if (!items || !items.length) return;
+        return items && items.length ? items : null;
+      });
+      if (!zoneItems.some(Boolean) && defaultItem && zoneItems.length) zoneItems[0] = [defaultItem];
+      layout.zones.forEach((zone, i) => {
+        const items = zoneItems[i];
+        if (!items) return;
 
         const div = document.createElement('div');
         div.className = 'zone';
@@ -8359,7 +8560,7 @@
         const iframe = document.createElement('iframe');
         iframe.setAttribute('sandbox', 'allow-scripts');   // never the widget same-origin opt-out
         iframe.allow = 'autoplay; fullscreen';
-        const bundleUrl = `${config.serverUrl}/api/content/${a.content_id}/bundle?rev=${a.content_rev || 0}`;
+        const bundleUrl = `${config.serverUrl}/api/content/${a.content_id}/bundle?rev=${a.content_rev || 0}${a.transparent_bg ? '&transparent=1' : ''}`;
         if (typeof registerBundleFrame === 'function' && typeof zoneBundleSkip === 'function') {
           div.__stBundleReg = registerBundleFrame(iframe,
             (reg, reason) => zoneBundleSkip(reg, { zone, div, items, index, item: a, advance }, reason));
@@ -8372,7 +8573,7 @@
         if (multi) timers[zone.id] = setTimeout(advance, dur);
       } else if (a.widget_id) {
         const iframe = document.createElement('iframe');
-        iframe.src = `${config.serverUrl}/api/widgets/${a.widget_id}/render?device=${encodeURIComponent(config.deviceId||'')}&rev=${a.widget_rev||0}${a.widget_panel ? '#panel=' + encodeURIComponent(a.widget_panel) : ''}`;
+        iframe.src = `${config.serverUrl}/api/widgets/${a.widget_id}/render?device=${encodeURIComponent(config.deviceId||'')}&rev=${a.widget_rev||0}${a.transparent_bg ? '&transparent=1' : ''}${a.widget_panel ? '#panel=' + encodeURIComponent(a.widget_panel) : ''}`;
         // Sandbox into a unique origin so widget scripts can't read window.parent
         // state (localStorage / JWT). allow-scripts keeps inline widget code running.
         iframe.setAttribute('sandbox', widgetSandboxAttr(a));
@@ -8878,7 +9079,7 @@
       const src = mediaUrl(a);
       if (a.widget_id) {
         const iframe = document.createElement('iframe');
-        iframe.src = `${config.serverUrl}/api/widgets/${a.widget_id}/render?device=${encodeURIComponent(config.deviceId || '')}&rev=${a.widget_rev || 0}${a.widget_panel ? '#panel=' + encodeURIComponent(a.widget_panel) : ''}`;
+        iframe.src = `${config.serverUrl}/api/widgets/${a.widget_id}/render?device=${encodeURIComponent(config.deviceId || '')}&rev=${a.widget_rev || 0}${a.transparent_bg ? '&transparent=1' : ''}${a.widget_panel ? '#panel=' + encodeURIComponent(a.widget_panel) : ''}`;
         iframe.setAttribute('sandbox', widgetSandboxAttr(a));
         return { el: iframe, video: null };
       }
@@ -9318,7 +9519,7 @@
           ctx.fillStyle = '#3b82f6';
           ctx.font = 'bold 28px sans-serif';
           ctx.textAlign = 'center';
-          ctx.fillText('ScreenTinker Web Player', W / 2, H / 2 - 40);
+          ctx.fillText(brandTitle(), W / 2, H / 2 - 40);
           ctx.fillStyle = '#94a3b8';
           ctx.font = '16px sans-serif';
           const item = playlist[currentIndex];
@@ -9627,12 +9828,13 @@
     infoDiv.id = 'infoOverlay';
     infoDiv.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;background:rgba(0,0,0,0.85);z-index:800;display:none;flex-direction:column;align-items:center;justify-content:center;color:#f1f5f9;font-family:-apple-system,sans-serif';
     infoDiv.innerHTML = `
-      <h2 style="color:#3b82f6;margin-bottom:16px">${_t('info_title')}</h2>
+      <h2 data-brand-title style="color:#3b82f6;margin-bottom:16px"></h2>
       <div style="font-size:14px;line-height:2;text-align:center;color:#94a3b8" id="infoContent"></div>
       <p style="margin-top:24px;font-size:12px;color:#64748b">${_t('info_close_hint')}</p>
     `;
     infoDiv.onclick = () => { infoDiv.style.display = 'none'; };
     document.body.appendChild(infoDiv);
+    applyBrand();
 
     // Escape user-controllable values before injecting into innerHTML — filenames,
     // device names, and server URLs are stored on the server and could contain HTML.
@@ -9796,6 +9998,16 @@
       const serviceWorkerUrl = IS_LEGACY_PLAYER ? '/sw-legacy.js' : '/sw.js';
       navigator.serviceWorker.register(serviceWorkerUrl).then(reg => {
         console.log('Service Worker registered');
+        /*
+         * Ask for persistent storage, so the browser does not evict the offline media under storage
+         * pressure ("best-effort" storage can be cleared without asking). A browser may grant it
+         * silently, refuse, or not have the API; the answer goes in the offline-cache report.
+         */
+        try {
+          if (navigator.storage && typeof navigator.storage.persist === 'function') {
+            navigator.storage.persist().then((ok) => { storagePersisted = !!ok; }, () => { storagePersisted = false; });
+          }
+        } catch (e) { /* locked-down browser */ }
         /*
          * ⚠️ PIN ONCE AT BOOT. requestOfflineCache had only two call sites, both inside
          * handlePlaylistUpdate, so a device that cold-boots from cache and thereafter sees only

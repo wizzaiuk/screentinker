@@ -1,6 +1,6 @@
-# Embedded Renderer for Digital Signage (E-Paper & MCU Displays)
+# Embedded Renderer for Digital Signage (E-Paper, Smart LED Matrices & MCU Displays)
 
-ScreenTinker includes a dedicated server-side embedded renderer designed for lightweight microcontrollers (MCUs) such as the **ESP32-S3**, **Raspberry Pi Pico W**, the **Seeed Studio reTerminal Sticky** (3.97" B/W E-Paper 800×480 with SSD1677), and the **Seeed Studio reTerminal E-Series** (`E1001` 7.5" Mono, `E1002` 7.3" 6-Color Spectra 6, `E1003` 10.3" 16-Level Grayscale, `E1004` 13.3" 6-Color Spectra 6).
+ScreenTinker includes a dedicated server-side embedded renderer designed for lightweight microcontrollers (MCUs) such as the **ESP32-S3 / ESP32-C6 / ESP32-C3**, **Raspberry Pi Pico W**, the **Seeed Studio reTerminal Sticky** (3.97" B/W E-Paper 800×480 with SSD1677), the **Seeed Studio reTerminal E-Series** (`E1001` 7.5" Mono, `E1002` 7.3" 6-Color Spectra 6, `E1003` 10.3" 16-Level Grayscale, `E1004` 13.3" 6-Color Spectra 6), and the **Seeed Studio XIAO Smart LED Controller** (`seeed-xiao-led` driving WS2812B / SK6812 addressable RGB LED strips and 2D matrices).
 
 Instead of requiring the display hardware to run a full web browser or render HTML/CSS, the embedded system periodically makes an HTTP `GET` request to the ScreenTinker server and receives a **pre-rendered, pre-dithered binary image** formatted specifically for its display panel.
 
@@ -138,15 +138,15 @@ Fetches the pre-rendered image for the current playlist item.
 - **`X-ST-Firmware-Version`** *(header, optional)*: Firmware / client version string (e.g. `1.3.0`). Updates `devices.app_version`.
 - **`orientation`** *(query, optional)*: The same as `X-ST-Device-Orientation`, for this request. On a dashboard preview (`preview=1`) or with an API token it is applied to that render only and not remembered.
 - **`rotation`** *(query, optional)*: The same as `X-ST-Device-Rotation`, for this request.
-- **`format`** *(query, optional)*: Override output format (`x-epd-packed`, `x-epd-spectra6`, `x-epd-gray16`, `png`, `jpeg`, `bmp`, `raw`).
+- **`format`** *(query, optional)*: Override output format (`x-epd-packed`, `x-epd-gray4`, `x-epd-spectra6`, `x-epd-gray16`, `png`, `jpeg`, `bmp`, `raw`).
 - **`dither`** *(query, optional)*: Override dithering algorithm (`floyd-steinberg`, `atkinson`, `none`).
-- **`mode`** *(query, optional)*: `layout` (forces multi-zone layout rendering), `single` (forces single-item rendering). When omitted, automatically renders in multi-zone layout mode if the device has an assigned multi-zone layout (`zones.length > 1`), or single-item mode otherwise.
+- **`mode`** *(query, optional)*: `layout` (forces multi-zone layout rendering), `single` (forces single-item rendering). When omitted, automatically renders in multi-zone layout mode if the device has an assigned multi-zone layout (`zones.length > 1`), or single-item mode otherwise (inheriting `background_color` from the zone when a 1-zone layout is assigned).
 - **`item`** *(query, optional)*: Force a specific playlist item index (0-based integer) for step testing or previewing.
 - **`preview`** *(query, optional)*: Set `preview=1` to bypass ETag 304 check and cache read/write (always renders live).
 
 #### Responses
 - **`200 OK`**: Binary image body formatted per the device's `screen_profile`.
-  - Content-Type: `application/octet-stream` (for `x-epd-packed`, `x-epd-spectra6`, `x-epd-gray16`, or `raw`), `image/png`, `image/jpeg`, or `image/bmp`.
+  - Content-Type: `application/octet-stream` (for `x-epd-packed`, `x-epd-gray4`, `x-epd-spectra6`, `x-epd-gray16`, or `raw`), `image/png`, `image/jpeg`, or `image/bmp`.
   - Response Headers:
     - `ETag`: `"sha256-hash..."`
     - `X-ST-Expires-In`: Seconds until the current item ends, or seconds until morning 'on' window if display power schedule is off (sleep timer for MCU). Raised to at least `profile.minRefreshInterval` while the panel stays on, but never past its next scheduled-off edge.
@@ -159,6 +159,8 @@ Fetches the pre-rendered image for the current playlist item.
     - `X-ST-Screen-Width` / `X-ST-Screen-Height`: The dimensions of the frame in this body, as sent (after any server-side rotation).
     - `X-ST-Rotation`: The mount rotation the frame was composed for (`0`, `90`, `180`, `270`). See [Orientation and rotation](#orientation-and-rotation) for what firmware should do with it.
     - `X-ST-Orientation`: The stated orientation, or when none was stated, the shape of the composed frame (`portrait` when it is taller than wide, else `landscape`).
+    - `X-ST-Color-Mode`: The active color depth for this frame (`1bit`, `gray4`, `gray16`, `spectra6`, etc.). Sent on both `200` and `304` responses so the firmware can validate payload format.
+    - `X-ST-Refresh-Mode`: Server refresh hint (`full` or `partial`). Advises `full` on first render, playlist item/layout transitions, display parameter changes (`orientation`, `colorDepth`, `dither`, `fitMode`, `backgroundColor`), or when `profile.refreshMode === 'always_full'`; advises `partial` for incremental updates on partial-refresh-capable panels.
     - `X-ST-Supports-Partial`: `'1'` if device supports fast partial refresh; `'0'` if full refresh is required.
     - `X-ST-Item-Index`: Current playlist item index (0-based) in single mode or `'0'` in layout mode.
     - `X-ST-Total-Items`: Total active items in playlist (in single-item mode).
@@ -249,6 +251,8 @@ Rate-limited and protected by `pairLockout`.
 }
 ```
 `screen_width` / `screen_height` default to the preset's. When `screen_profile` is a preset key, it is also recorded as the board the hardware reports (`devices.reported_board`): the firmware sends the preset it was built for, while `screen_profile` stays an editable setting.
+
+For presets that declare `parameterizedDimensions: true` (`seeed-xiao-led`), passing custom `screen_width` and `screen_height` during registration (within valid bounds: `1..512` per edge and `width * height <= 16384`) automatically stores `{"preset":"seeed-xiao-led","width":W,"height":H}` in `devices.screen_profile` so the device's runtime LED matrix geometry is preserved across subsequent renders and dashboard settings updates. Fixed-geometry e-paper presets always keep their native panel resolution.
 
 #### Response (`200 OK`)
 ```json
@@ -361,7 +365,7 @@ On an embedded device's page (**Displays → select device**):
 - **Diagnostic Logs**: the newest upload, with **Request Diagnostic Logs** (queues `upload_logs` for the next poll) and **Copy**. It refreshes itself when an upload arrives (`dashboard:embedded-logs`).
 - **Display Power Schedule**: the weekly on/off schedule behind `X-ST-Power-State` and the overnight `X-ST-Expires-In`.
 
-The device **Orientation** setting in Settings (`devices.orientation`) does not affect embedded renders: an embedded panel's orientation is what the panel states (its own menu or IMU, in `screentinker_mcu`) or the `orientation` / `rotation` in its `screen_profile`.
+When an operator explicitly changes the **Orientation** dropdown on an embedded device's Settings page and saves, `screen_profile.orientation` is updated and `devices.reported_orientation` is cleared to `NULL` so the dashboard setting takes effect immediately (while leaving `devices.orientation`, which defaults to `'landscape'` on every row, ignored unless explicitly changed).
 
 ---
 
@@ -375,43 +379,76 @@ A device's screen configuration is stored in the `devices.screen_profile` JSON c
 |---|---|---|---|
 | `width` | `number` | Positive integer (e.g. `800`) | Logical pixel width |
 | `height` | `number` | Positive integer (e.g. `480`) | Logical pixel height |
+| `parameterizedDimensions` | `boolean` | `true` | Marks presets with user-configurable runtime dimensions (`seeed-xiao-led`); enforces `width <= 512`, `height <= 512`, and `width * height <= 16384` |
 | `orientation` | `string` | `landscape`, `portrait`, `landscape-flipped`, `portrait-flipped` | Composition orientation: swaps `width`/`height` when they disagree with it |
 | `rotation` | `number` | `0`, `90`, `180`, `270` | Mounting rotation in degrees. A profile's own `rotation` wins over its own `orientation` |
 | `mcuTranspose` | `boolean` | `true` | The panel transposes portrait frames itself (see [Orientation and rotation](#orientation-and-rotation)). Set on the E1001-E1004 presets |
-| `colorDepth` | `string` | `1bit`, `4bit-gray`, `gray16`, `spectra6`, `16bit-rgb565`, `24bit-rgb888` | Color quantization mode |
+| `colorDepth` | `string` | `1bit`, `gray4`, `4bit-gray`, `gray16`, `spectra6`, `16bit-rgb565`, `24bit-rgb888` | Color quantization mode |
 | `dither` | `string` | `floyd-steinberg`, `atkinson`, `none` | Dithering algorithm |
-| `outputFormat` | `string` | `x-epd-packed`, `x-epd-spectra6`, `x-epd-gray16`, `bmp`, `raw`, `png`, `jpeg` | Serialization format |
+| `outputFormat` | `string` | `x-epd-packed`, `x-epd-gray4`, `x-epd-spectra6`, `x-epd-gray16`, `bmp`, `raw`, `png`, `jpeg` | Serialization format |
 | `supportsPartialRefresh` | `boolean` | `true`, `false` | Whether display hardware supports partial refresh |
+| `refreshMode` | `string` | `smart_partial`, `always_full` | Per-device refresh behavior hint for `X-ST-Refresh-Mode` (`smart_partial` default) |
 | `minRefreshInterval` | `number` | Positive integer (seconds) | Minimum polling / refresh interval |
 
 ### Output Format Details
 
 - **`x-epd-packed`**: 1-bit MSB-first packed bitstream without row-padding. For an 800×480 screen, this produces exactly `(800 * 480) / 8 = 48,000 bytes`. This can be written directly to SSD1677, SSD1608, or UC8151 controller RAM over SPI.
+- **`x-epd-gray4`**: 2bpp MSB-first packed buffer (4 pixels per byte: bits `7..6`, `5..4`, `3..2`, `1..0`), quantized to 4 gray levels (`0` black `#000000`, `1` dark gray `#555555`, `2` light gray `#AAAAAA`, `3` white `#FFFFFF`) using BT.601 luminance and Floyd-Steinberg error diffusion. For an 800×480 screen (`seeed-reterminal-sticky`, `seeed-reterminal-e1001`), this produces `96,000 bytes`. The frame width must be divisible by 4.
 - **`x-epd-spectra6`**: 4bpp packed buffer, 2 pixels per byte, the LEFT (even-x) pixel in the HIGH nibble, rows back to back. Quantized to the 6-color Spectra palette by Euclidean distance with Floyd-Steinberg error diffusion in RGB space; the nibble is the controller code (`0` black, `1` white, `2` yellow, `3` red, `5` blue, `6` green; `4` unused). The frame width must be even.
 - **`x-epd-gray16`**: 4bpp packed buffer in the same nibble order (high nibble first), 16 gray levels (`0` black ... `15` white) with Floyd-Steinberg error diffusion. The frame width must be even. (`screentinker_mcu` reads `(byte >> 4)` for even x and `(byte & 0x0F)` for odd x, and the IT8951 driver bursts the buffer as is.)
 - **`1bit` packing** (`x-epd-packed`, `raw`) accepts any width, odd ones included; rows are packed back to back with no padding.
 - **`bmp`**: Standard 1-bit Windows BMP (Bitmap DIB v3) with 2-color palette (Black / White).
 - **`png` & `jpeg`**: Rendered raster images with dithering applied (ideal for browser previewing and debugging).
 - **`16bit-rgb565`**: 2 bytes per pixel (Little-Endian R5G6B5) for SPI TFT displays (ILI9341, ST7789).
+- **`24bit-rgb888` (`raw`)**: 3 bytes per pixel (`R, G, B` in logical row-major top-left order, no header, `width * height * 3` bytes) for addressable smart RGB LED strips and 2D matrices (`seeed-xiao-led`). Dithering is bypassed (`dither: 'none'`) to preserve crisp pixel art and color gradients. Requesting `?format=jpeg` or `?format=jpg` on a `24bit-rgb888` device encodes the rendered frame as `image/jpeg` for dashboard live previews.
 
 ---
 
 ### Orientation and rotation
 
-**Nothing changes unless something states an orientation.** A panel renders its stored `screen_profile` exactly as it always did (same bytes, same ETag) unless one of these says otherwise, in this order:
+Both the **device** (via its local menu or IMU accelerometer) and the **dashboard** (via the Device Settings tab) can configure orientation. **Nothing changes unless something states an orientation**: a panel with no orientation stated renders its stored `screen_profile` exactly as it always did (same bytes, same ETag).
 
-1. this request: `?orientation=` / `?rotation=` / `X-ST-Device-Orientation` / `X-ST-Device-Rotation`;
-2. what the **device itself** stated on an earlier poll (`devices.reported_orientation`, `NULL` until it does; never set by a dashboard preview or an API token);
-3. the profile's own `orientation` / `rotation` fields.
+#### 1. Priority Hierarchy (`resolveOrientationRotation` & `parseProfile`)
 
-`devices.orientation` (the general Settings field, `landscape` by default on every row) is **not** one of them.
+When `/api/embedded/render` (or `/info` / `/render-layout`) resolves the orientation for a request, it checks three sources in order from highest to lowest priority:
 
-A stated portrait orientation on a landscape box (or the reverse) swaps `width` and `height`; the rotation is the stated one, else the orientation's (`portrait` 90, `landscape-flipped` 180, `portrait-flipped` 270). A freshly paired **E1004** (1200x1600) therefore renders portrait by default.
+```
+Priority 1 (Highest): Current HTTP Request Header / Query
+  └─ X-ST-Device-Orientation / X-ST-Device-Rotation (or ?orientation= / ?rotation=)
+       │
+       ▼ (if not sent on this request)
+Priority 2: Last Device-Reported Orientation in DB
+  └─ devices.reported_orientation (remembered from the panel's last poll header;
+     never written by a dashboard preview or API token)
+       │
+       ▼ (if NULL — panel never reported one, or operator cleared it in Dashboard)
+Priority 3 (Lowest): Dashboard / Screen Profile Setting
+  └─ devices.screen_profile.orientation / rotation (set in Dashboard → Device Settings)
+```
 
-**What `X-ST-Rotation` means for firmware** depends on who turns the frame:
+*(Note: `devices.orientation`—the general player Settings column that defaults to `'landscape'` on every database row—is never read directly by the embedded renderer.)*
 
-- **Server-side rotation** (every profile without `mcuTranspose`, as in all earlier releases): the frame is composed at `width` x `height`, then rotated by `rotation`, so the body is already in the panel's native order and `X-ST-Screen-Width/-Height` are the rotated dimensions. `X-ST-Rotation` is informational: **do not rotate again**.
-- **MCU transpose** (`mcuTranspose`: the E1001-E1004 presets, a profile that sets it, and the Sticky preset when the request states an orientation, because only `screentinker_mcu` >= 1.3.0 does): the body is sent as composed, `X-ST-Screen-Width/-Height` are the composed dimensions, and the server has applied only the 180-degree part of a flipped mount (`landscape-flipped`, `portrait-flipped`). When `X-ST-Screen-Width/-Height` differ from the panel's native dimensions, the firmware transposes the frame 90 degrees into native order; otherwise it writes it as is. `X-ST-Rotation` tells it which mount the frame was composed for.
+#### 2. How Real-World Scenarios Behave
+
+| Scenario | Behavior |
+|---|---|
+| **A. Device has IMU auto-rotation ON (or fixed orientation configured on the device) and sends `X-ST-Device-Orientation` on every poll** | **The device wins.** Every time the MCU wakes up and polls `/api/embedded/render` with `X-ST-Device-Orientation` (from its IMU or on-device NVS config), Priority 1 applies immediately and the server updates `devices.reported_orientation` (Priority 2) so dashboard previews match the physical panel. |
+| **B. Device does NOT send `X-ST-Device-Orientation` (or only sent it once in the past), and the operator changes Orientation in the Dashboard** | **The Dashboard setting takes effect.** Changing **Orientation** in the dashboard and clicking **Save Settings** (`PUT /api/devices/:id`) writes `screen_profile.orientation = '<new>'` (Priority 3) **and resets `devices.reported_orientation = NULL`** (clearing Priority 2). As long as the device does not override it with an `X-ST-Device-Orientation` header on subsequent polls, the server composes frames in the dashboard-selected orientation. |
+| **C. Operator opens Dashboard Settings and edits only Notes / Tags / Color Mode (without changing Orientation)** | **Nothing is overwritten.** The dashboard tracks whether `#deviceOrientation` was actually changed before saving; saving unrelated settings does not touch `screen_profile.orientation` or clear `devices.reported_orientation`. |
+
+#### 3. Who Rotates the Pixels? (Server vs. MCU Transpose)
+
+A stated `portrait` / `portrait-flipped` orientation on a landscape preset (or `landscape` / `landscape-flipped` on a native portrait preset like the 1200×1600 **E1004**) swaps the composition `width` and `height` so widgets, text, and `contain`/`cover` images are laid out upright (`portrait` = 90°, `landscape-flipped` = 180°, `portrait-flipped` = 270°).
+
+How the final binary buffer is oriented depends on whether the device uses **MCU transpose** (`mcuTranspose`):
+
+- **MCU transpose (`mcuTranspose: true`)** — *Used by the `seeed-reterminal-e1001`–`e1004` presets, any custom profile setting `mcuTranspose: true`, and `seeed-reterminal-sticky` when the request or `reported_orientation` states an orientation (`screentinker_mcu` >= 1.3.0)*:
+  - The server sends the frame at its **composed dimensions** (e.g. `480×800` for portrait on an `800×480` panel) with `X-ST-Screen-Width: 480`, `X-ST-Screen-Height: 800`, and `X-ST-Rotation: 90` (or `270`).
+  - The server applies only the `180°` flip for flipped mounts (`landscape-flipped`, `portrait-flipped`).
+  - When `X-ST-Screen-Width` / `X-ST-Screen-Height` differ from the panel's native dimensions, the **MCU firmware transposes the buffer 90° into native controller RAM order**.
+- **Server-side rotation (`mcuTranspose: false`)** — *Used by legacy Sticky `v1.2.0` panels (which never send `X-ST-Device-Orientation` headers) when rotated via the Dashboard, and by generic Waveshare / SPI TFT profiles*:
+  - The frame is composed at `width × height` (e.g. `480×800`) and then **rotated by the server** into the panel's native pixel order (`800×480`) before bit-packing.
+  - `X-ST-Screen-Width` and `X-ST-Screen-Height` report the final rotated dimensions (`800` and `480`). `X-ST-Rotation` is informational only: **firmware must not rotate again**.
 
 ---
 
@@ -419,11 +456,12 @@ A stated portrait orientation on a landscape box (or the reverse) swaps `width` 
 
 | Preset Key | Width | Height | Depth | Format | Partial Refresh | Notes |
 |---|---|---|---|---|---|---|
-| `seeed-reterminal-sticky` | 800 | 480 | `1bit` | `x-epd-packed` | Yes (350ms) | Seeed Studio reTerminal Sticky (SSD1677, touch) |
-| `seeed-reterminal-e1001` | 800 | 480 | `1bit` | `x-epd-packed` | Yes (350ms) | Seeed Studio reTerminal E1001 (7.5" Mono) |
+| `seeed-reterminal-sticky` | 800 | 480 | `1bit` / `gray4` | `x-epd-packed` / `x-epd-gray4` | Yes (350ms in 1-bit) | Seeed Studio reTerminal Sticky (SSD1677, touch) |
+| `seeed-reterminal-e1001` | 800 | 480 | `1bit` / `gray4` | `x-epd-packed` / `x-epd-gray4` | Yes (350ms in 1-bit) | Seeed Studio reTerminal E1001 (7.5" Mono) |
 | `seeed-reterminal-e1002` | 800 | 480 | `spectra6` | `x-epd-spectra6` | No (min 30s) | Seeed Studio reTerminal E1002 (7.3" 6-Color Spectra 6) |
 | `seeed-reterminal-e1003` | 1872 | 1404 | `gray16` | `x-epd-gray16` | Yes (180ms) | Seeed Studio reTerminal E1003 (10.3" Gray16, touch) |
 | `seeed-reterminal-e1004` | 1200 | 1600 | `spectra6` | `x-epd-spectra6` | No (min 60s) | Seeed Studio reTerminal E1004 (13.3" 6-Color Spectra 6) |
+| `seeed-xiao-led` | 5 (param.) | 1 (param.) | `24bit-rgb888` | `raw` | Yes (50ms) | Seeed Studio XIAO LED Controller (WS2812B/SK6812 strip/matrix) |
 | `waveshare-7.5in-v2` | 800 | 480 | `1bit` | `x-epd-packed` | - | Waveshare 7.5" e-Paper |
 | `waveshare-4.2in-v2` | 400 | 300 | `1bit` | `x-epd-packed` | - | Waveshare 4.2" e-Paper |
 | `waveshare-2.9in-v2` | 296 | 128 | `1bit` | `x-epd-packed` | - | Waveshare 2.9" e-Paper |
@@ -432,11 +470,26 @@ A stated portrait orientation on a landscape box (or the reverse) swaps `width` 
 | `generic-320x240-rgb565` | 320 | 240 | `16bit-rgb565` | `raw` | - | Standard 2.4"/2.8" SPI TFT |
 | `generic-128x64-1bit` | 128 | 64 | `1bit` | `raw` | - | SSD1306 0.96" OLED |
 
+### 5.1 Smart RGB LED Strip & Matrix Mode (`seeed-xiao-led`)
+
+The `seeed-xiao-led` preset turns ScreenTinker into a pixel-art, ticker, and ambient signage server for **Seeed Studio XIAO ESP32-C6 / ESP32-S3 / ESP32-C3** microcontrollers paired with the **Seeed Studio LED Driver Board for XIAO** (SKU 105100021, 5V level-shifted `WS2812B` / `SK6812` output):
+
+- **Parametric Matrix Dimensions (`parameterizedDimensions: true`)**:
+  - Defaults to `5×1` (5-LED ambient strip), but supports any runtime strip or 2D matrix resolution configured on the MCU (e.g. `32×8` LED banner, `16×16` grid, `64×64` or `128×64` matrix wall) up to **`512` pixels per edge** and **`16,384` total pixels** (48 KB raw RGB888 payload).
+  - During `POST /api/embedded/pair/register`, the MCU sends its configured `screen_width` and `screen_height` from NVS (`led_driver_get_matrix_config()`). The server persists `{"preset":"seeed-xiao-led","width":W,"height":H}` in `devices.screen_profile`.
+  - Updating orientation or other settings via `PUT /api/devices/:id` in the dashboard automatically preserves the device's custom `width` and `height`.
+- **Wire Protocol & Coordinate Mapping**:
+  - `GET /api/embedded/render` returns `Content-Type: application/octet-stream` (`X-ST-Color-Mode: 24bit-rgb888`) containing `width * height * 3` raw RGB888 bytes (`[R0, G0, B0, R1, G1, B1, ...]`) ordered in standard **top-left, row-major** raster sequence.
+  - Physical LED wiring topology—**Serpentine** (zig-zag) vs. **Progressive** (linear), **Row-Major** vs. **Column-Major** scanning axis, and **Origin Corner** (`TOP_LEFT`, `TOP_RIGHT`, `BOTTOM_LEFT`, `BOTTOM_RIGHT`)—is translated on the MCU at display-refresh time (`led_matrix_map.h`), keeping the server's render cache independent of physical panel wiring.
+- **Dashboard Controls**:
+  - Displays a **`24-Bit RGB`** color mode badge and automatically hides the E-Paper dithering selector (`#epdDither`), since LEDs render full 24-bit color without monochrome quantization.
+  - Supports live browser previews via `?format=jpeg` (`image/jpeg`).
+
 ---
 
 ## 6. Reference ESP32 Firmware Implementation (C++ / Arduino)
 
-For the complete production firmware supporting the **Seeed Studio reTerminal Sticky & E-Series (`E1001`–`E1004`)**—including Captive Portal Wi-Fi onboarding, 6-digit PIN pairing, PSRAM frame caching, IMU auto-rotation, SHT40 telemetry, dual-partition OTA rollback, and a native SDL2 desktop simulator—see the **[`screentinker_mcu`](https://github.com/renebohne/screentinker_mcu)** repository.
+For the complete production firmware supporting the **Seeed Studio reTerminal Sticky & E-Series (`E1001`–`E1004`)** and **Seeed Studio XIAO Smart LED Controllers (`ESP32-C6` / `ESP32-S3` / `ESP32-C3`)**—including the [1-Click Universal Browser Web Flasher](https://www.rene-bohne.de/screentinker_mcu/tools/), Captive Portal Wi-Fi onboarding, 6-digit PIN pairing, dynamic LED matrix serpentine/progressive coordinate mapping, PSRAM frame caching, IMU auto-rotation, SHT40 telemetry, dual-partition OTA rollback, and a native SDL2 desktop simulator—see the **[`screentinker_mcu`](https://github.com/renebohne/screentinker_mcu)** repository.
 
 Below is a minimal standalone reference sketch illustrating the core HTTP polling and ETag sleep loop:
 

@@ -38,8 +38,14 @@ class DeviceInfo(private val context: Context) {
 
     fun getTelemetry(): JSONObject {
         return JSONObject().apply {
-            put("battery_level", getBatteryLevel())
-            put("battery_charging", isBatteryCharging())
+            // #724: a mains-powered panel (most Android TVs / boxes) has no battery, but the
+            // vendor's dummy battery driver still answers ACTION_BATTERY_CHANGED with a bogus
+            // level, so reporting a number unconditionally made a batteryless TV read "42%,
+            // charging" forever and could trip or silence a battery alert. Gate on EXTRA_PRESENT
+            // and send NULL when no battery is present; the server and dashboard already read a
+            // null battery as "mains / not applicable" (thresholds.js, same as the web player).
+            put("battery_level", getBatteryLevel() ?: JSONObject.NULL)
+            put("battery_charging", isBatteryCharging() ?: JSONObject.NULL)
             put("storage_free_mb", getStorageFreeMB())
             put("storage_total_mb", getStorageTotalMB())
             put("ram_free_mb", getRamFreeMB())
@@ -97,6 +103,8 @@ class DeviceInfo(private val context: Context) {
                 put("can_install_silently", policy.canInstallSilently())
                 put("foreign_device_owner", policy.hasForeignDeviceOwner())
             } catch (_: Throwable) { put("tier", 0) }
+            // #720: how this player can manage Wi-Fi (owner / direct / suggestions / unsupported).
+            try { put("wifi_mode", com.remotedisplay.player.net.WifiNetworkManager.modeFor(context)) } catch (_: Throwable) { }
             // #160 Track-A capability flags (NO device-owner dependency) — let the dashboard gate the
             // no-privilege system controls and show the operator exactly what's grantable per panel.
             try {
@@ -147,9 +155,20 @@ class DeviceInfo(private val context: Context) {
         ).any { it.resolveInfo.serviceInfo.let { si -> android.content.ComponentName(si.packageName, si.name) == mine } }
     } catch (_: Throwable) { false }
 
-    private fun getBatteryLevel(): Int {
+    /**
+     * #724: true only when the board reports an actual battery. Default to `true` when the extra
+     * is absent, so a device that does not report EXTRA_PRESENT at all behaves exactly as before
+     * (we only suppress a reading when the board explicitly says there is no battery). Boards that
+     * lie the other way — present = true with a fake level — are handled by the per-device
+     * "ignore battery" override on the server, not here.
+     */
+    private fun batteryPresent(intent: Intent?): Boolean =
+        intent?.getBooleanExtra(BatteryManager.EXTRA_PRESENT, true) ?: true
+
+    private fun getBatteryLevel(): Int? {
         // Use broadcast intent method - more reliable on Android TV / Rockchip devices
         val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if (!batteryPresent(intent)) return null   // #724: mains-powered panel, no battery
         if (intent != null) {
             val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
             val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
@@ -157,11 +176,13 @@ class DeviceInfo(private val context: Context) {
         }
         // Fallback to BatteryManager API
         val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-        return bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        val cap = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        return if (cap in 0..100) cap else null
     }
 
-    private fun isBatteryCharging(): Boolean {
+    private fun isBatteryCharging(): Boolean? {
         val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if (!batteryPresent(intent)) return null   // #724: mains-powered panel, no battery
         val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
         return status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
     }

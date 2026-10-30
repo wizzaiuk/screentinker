@@ -15,7 +15,7 @@
   // packaged config.xml via the Tizen application API; fall back to a constant that
   // build-wgt.sh stamps from config.xml's version="" so the dashboard always shows the
   // version that is actually installed (never the old hardcoded '1.0.0').
-  var APP_VERSION_FALLBACK = '3.0.1'; // st:app-version — stamped by build-wgt.sh
+  var APP_VERSION_FALLBACK = '3.0.3'; // st:app-version — stamped by build-wgt.sh
   var APP_VERSION = (function () {
     try {
       var v = tizen.application.getCurrentApplication().appInfo.version;
@@ -1032,6 +1032,18 @@
     s.transform = 'translate(-50%, -50%) rotate(' + deg + 'deg)';
   }
 
+  /*
+   * #325/#660: the colour behind everything on the stage, the payload's background_color (the
+   * playlist's own colour, else the device's; the server picks). Empty puts the stylesheet's black
+   * back, so moving off a coloured playlist restores the screen's own colour. AVPlay video is its
+   * own element above the stage, so this never covers it.
+   */
+  function applyBackground(c) {
+    var ok = typeof c === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(c);
+    elStage.style.background = ok ? c : '';
+    document.body.style.background = ok ? c : '';
+  }
+
   function onPlaylist(payload) {
     if (!payload) return;
     // #473: a visitor is using an interactive page. Park the update (latest wins) and apply it on
@@ -1042,6 +1054,7 @@
     var interactiveOk = !payload.wall_config && !payload.group_sync;
     if (!interactiveOk) player.dropHold();
     player.setInteractiveAllowed(interactiveOk);
+    applyBackground(payload.background_color);
     if (payload.suspended) {
       player.stop();
       zoneRenderer.clear();

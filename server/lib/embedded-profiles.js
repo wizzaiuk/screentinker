@@ -25,15 +25,22 @@
 
 const PRESETS = {
   // ── Seeed Studio reTerminal Series ──────────────────────────────────────────
+  // NOTE: supportedColorModes and supportsPartialRefresh drive the dashboard dropdowns
+  // in frontend/js/views/device-detail.js (color mode & refresh behavior selectors).
+  // Keep both places in sync when adding presets or modes.
   'seeed-reterminal-sticky': {
     width: 800, height: 480, rotation: 0,
+    supportedColorModes: ['1bit', 'gray4'],
+    defaultColorDepth: '1bit',
     colorDepth: '1bit', dither: 'floyd-steinberg', outputFormat: 'x-epd-packed',
     supportsPartialRefresh: true, minRefreshInterval: 5,
     fullRefreshDurationMs: 1800, partialRefreshDurationMs: 350,
-    touchSupported: true, touchController: 'FT6336U',
+    touchSupported: true, touchController: 'GT911',
   },
   'seeed-reterminal-e1001': {
     width: 800, height: 480, rotation: 0,
+    supportedColorModes: ['1bit', 'gray4'],
+    defaultColorDepth: '1bit',
     colorDepth: '1bit', dither: 'floyd-steinberg', outputFormat: 'x-epd-packed',
     supportsPartialRefresh: true, minRefreshInterval: 5,
     fullRefreshDurationMs: 3000, partialRefreshDurationMs: 350,
@@ -42,6 +49,8 @@ const PRESETS = {
   },
   'seeed-reterminal-e1002': {
     width: 800, height: 480, rotation: 0,
+    supportedColorModes: ['spectra6'],
+    defaultColorDepth: 'spectra6',
     colorDepth: 'spectra6', dither: 'floyd-steinberg', outputFormat: 'x-epd-spectra6',
     supportsPartialRefresh: false, minRefreshInterval: 30,
     fullRefreshDurationMs: 14000, partialRefreshDurationMs: 0,
@@ -50,6 +59,8 @@ const PRESETS = {
   },
   'seeed-reterminal-e1003': {
     width: 1872, height: 1404, rotation: 0,
+    supportedColorModes: ['gray16'],
+    defaultColorDepth: 'gray16',
     colorDepth: 'gray16', dither: 'floyd-steinberg', outputFormat: 'x-epd-gray16',
     supportsPartialRefresh: true, minRefreshInterval: 2,
     fullRefreshDurationMs: 1200, partialRefreshDurationMs: 180,
@@ -58,6 +69,8 @@ const PRESETS = {
   },
   'seeed-reterminal-e1004': {
     width: 1200, height: 1600, rotation: 0,
+    supportedColorModes: ['spectra6'],
+    defaultColorDepth: 'spectra6',
     colorDepth: 'spectra6', dither: 'floyd-steinberg', outputFormat: 'x-epd-spectra6',
     supportsPartialRefresh: false, minRefreshInterval: 60,
     fullRefreshDurationMs: 22000, partialRefreshDurationMs: 0,
@@ -106,11 +119,21 @@ const PRESETS = {
     width: 128, height: 32, rotation: 0,
     colorDepth: '1bit', dither: 'atkinson', outputFormat: 'raw',
   },
+  // ── LED Strip (Seeed Studio XIAO LED Controller) ──────────────────────────────
+  'seeed-xiao-led': {
+    width: 5, height: 1, rotation: 0,
+    parameterizedDimensions: true,
+    supportedColorModes: ['24bit-rgb888'],
+    defaultColorDepth: '24bit-rgb888',
+    colorDepth: '24bit-rgb888', dither: 'none', outputFormat: 'raw',
+    supportsPartialRefresh: true, minRefreshInterval: 1,
+    fullRefreshDurationMs: 50, partialRefreshDurationMs: 50,
+  },
 };
 
-const VALID_COLOR_DEPTHS   = new Set(['1bit', '4bit-gray', 'gray16', 'spectra6', '16bit-rgb565', '24bit-rgb888']);
+const VALID_COLOR_DEPTHS   = new Set(['1bit', 'gray4', '4bit-gray', 'gray16', 'spectra6', '16bit-rgb565', '24bit-rgb888']);
 const VALID_DITHERS        = new Set(['none', 'floyd-steinberg', 'atkinson']);
-const VALID_OUTPUT_FORMATS = new Set(['png', 'bmp', 'raw', 'x-epd-packed', 'x-epd-spectra6', 'x-epd-gray16', 'jpeg', 'jpg']);
+const VALID_OUTPUT_FORMATS = new Set(['png', 'bmp', 'raw', 'x-epd-packed', 'x-epd-gray4', 'x-epd-spectra6', 'x-epd-gray16', 'jpeg', 'jpg']);
 const VALID_ROTATIONS      = new Set([0, 90, 180, 270]);
 
 const DEFAULTS = {
@@ -143,6 +166,7 @@ const VALID_ORIENTATIONS = new Set(['landscape', 'portrait', 'landscape-flipped'
  */
 const MCU_TRANSPOSE_STATED = new Set(['seeed-reterminal-sticky']);
 const NIBBLE_DEPTHS = new Set(['spectra6', 'gray16']);
+const CRUMB_DEPTHS  = new Set(['gray4']);
 
 /**
  * Return a validated, fully-populated profile object.
@@ -159,6 +183,31 @@ const NIBBLE_DEPTHS = new Set(['spectra6', 'gray16']);
  * @param {object|string} [overrides] Optional stated { orientation, rotation }.
  * @returns {object|null}  Validated profile, or null if raw is empty/unparseable/missing dims.
  */
+/*
+ * ⚠️ HOW BIG A RENDER MAY BE, decided by the PRESET, never by the profile. Every render is a headless
+ * Chromium screenshot plus a full RGBA bitmap in this process, so a 10000×10000 profile was ~400 MB
+ * per request on a shared server. A profile is operator JSON (PUT /devices, or what a panel sent at
+ * pairing), so a flag it carries cannot relax a limit: `parameterizedDimensions: false` in a profile
+ * used to switch the LED cap off. The LED cap comes from the preset's own definition, and raw RGB888
+ * output (what an LED controller takes) is held to it whatever the preset.
+ *
+ *   any profile        at most MAX_SIDE per side and MAX_PIXELS in all (a 4K panel; the largest
+ *                      real e-paper, reTerminal E1003, is 1872×1404)
+ *   LED / raw RGB888   at most LED_MAX_SIDE per side and LED_MAX_PIXELS in all
+ */
+const MAX_SIDE = 4096;
+const MAX_PIXELS = 3840 * 2160;
+const LED_MAX_SIDE = 512;
+const LED_MAX_PIXELS = 16384;
+function withinSizeLimit(presetName, obj, width, height) {
+  if (width > MAX_SIDE || height > MAX_SIDE || width * height > MAX_PIXELS) return false;
+  const preset = presetName ? PRESETS[presetName] : null;
+  const led = !!(preset && preset.parameterizedDimensions) ||
+    ((obj.colorDepth === '24bit-rgb888' || obj.colorDepth === 'rgb888') && obj.outputFormat === 'raw');
+  if (led && (width > LED_MAX_SIDE || height > LED_MAX_SIDE || width * height > LED_MAX_PIXELS)) return false;
+  return true;
+}
+
 function parseProfile(raw, overrides = {}) {
   if (!raw) return null;
   const opts = typeof overrides === 'string' ? { orientation: overrides } : (overrides || {});
@@ -195,9 +244,9 @@ function parseProfile(raw, overrides = {}) {
     obj = { ...PRESETS[obj.preset], ...obj };
   }
 
-  let width  = Number.isInteger(obj.width)  && obj.width  > 0 && obj.width  <= 10000 ? obj.width  : null;
-  let height = Number.isInteger(obj.height) && obj.height > 0 && obj.height <= 10000 ? obj.height : null;
-  if (!width || !height) return null;
+  let width  = Number.isInteger(obj.width)  && obj.width  > 0 ? obj.width  : null;
+  let height = Number.isInteger(obj.height) && obj.height > 0 ? obj.height : null;
+  if (!width || !height || !withinSizeLimit(presetName, obj, width, height)) return null;
 
   // A stated orientation wins; otherwise the profile's own `orientation` field, if it has one.
   const profileOrientation = VALID_ORIENTATIONS.has(obj.orientation) ? obj.orientation : null;
@@ -223,14 +272,27 @@ function parseProfile(raw, overrides = {}) {
 
   const mcuTranspose = obj.mcuTranspose === true || (stated && MCU_TRANSPOSE_STATED.has(presetName));
 
+  const rawDepth = obj.colorDepth === 'rgb888' ? '24bit-rgb888' : (obj.colorDepth === 'mono' ? '1bit' : obj.colorDepth);
   const result = {
     width,
     height,
     rotation,
-    colorDepth:   VALID_COLOR_DEPTHS.has(obj.colorDepth)      ? obj.colorDepth   : DEFAULTS.colorDepth,
+    colorDepth:   VALID_COLOR_DEPTHS.has(rawDepth)            ? rawDepth         : (obj.defaultColorDepth || DEFAULTS.colorDepth),
     dither:       VALID_DITHERS.has(obj.dither)               ? obj.dither       : DEFAULTS.dither,
     outputFormat: VALID_OUTPUT_FORMATS.has(obj.outputFormat)  ? obj.outputFormat : DEFAULTS.outputFormat,
   };
+
+  if (Array.isArray(obj.supportedColorModes)) {
+    result.supportedColorModes = [...obj.supportedColorModes];
+  }
+  if (obj.defaultColorDepth) {
+    result.defaultColorDepth = obj.defaultColorDepth;
+  }
+
+  // Validate: colorDepth must be supported by the profile (if supportedColorModes is defined)
+  if (result.supportedColorModes && !result.supportedColorModes.includes(result.colorDepth)) {
+    result.colorDepth = result.defaultColorDepth || DEFAULTS.colorDepth;
+  }
 
   if (orientation) {
     result.orientation = orientation;
@@ -242,9 +304,14 @@ function parseProfile(raw, overrides = {}) {
   // makes every row boundary straddle a byte. Refuse the profile rather than emit a skewed picture.
   // Only the nibble formats: 1-bit always accepted odd widths and fielded panels use them.
   if (NIBBLE_DEPTHS.has(result.colorDepth) && frameDimensions(result).width % 2 !== 0) return null;
+  // gray4 packs 4 pixels per byte: width must be divisible by 4 to avoid straddling byte boundaries.
+  if (CRUMB_DEPTHS.has(result.colorDepth) && frameDimensions(result).width % 4 !== 0) return null;
 
   if (typeof obj.supportsPartialRefresh === 'boolean') {
     result.supportsPartialRefresh = obj.supportsPartialRefresh;
+  }
+  if (obj.refreshMode === 'always_full' || obj.refreshMode === 'smart_partial') {
+    result.refreshMode = obj.refreshMode;
   }
   if (typeof obj.minRefreshInterval === 'number' && obj.minRefreshInterval >= 0) {
     result.minRefreshInterval = obj.minRefreshInterval;
@@ -260,6 +327,12 @@ function parseProfile(raw, overrides = {}) {
   }
   if (obj.touchController !== undefined) {
     result.touchController = obj.touchController;
+  }
+  if (typeof obj.fitMode === 'string') {
+    result.fitMode = obj.fitMode.toLowerCase();
+  }
+  if (typeof obj.backgroundColor === 'string') {
+    result.backgroundColor = obj.backgroundColor;
   }
 
   return result;
@@ -293,4 +366,4 @@ function listPresets() {
   return Object.keys(PRESETS).map(key => ({ key, ...PRESETS[key] }));
 }
 
-module.exports = { PRESETS, parseProfile, getPreset, listPresets, DEFAULTS, frameDimensions, frameOrientation };
+module.exports = { PRESETS, parseProfile, getPreset, listPresets, DEFAULTS, frameDimensions, frameOrientation, SIZE_LIMITS: { MAX_SIDE, MAX_PIXELS, LED_MAX_SIDE, LED_MAX_PIXELS } };

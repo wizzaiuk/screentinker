@@ -53,6 +53,16 @@ object PlayerCapabilities {
                 // Android-only capability: no browser/BrightSign/Tizen/e-ink player declares it, so the
                 // server's strip keeps rtsp items off screens that cannot open rtsp://.
                 "playback.rtsp",
+                // rtsps:// cameras (RTSP over TLS), certificate checked unless the item says
+                // tls_self_signed (player/RtspSources.kt). Separate so the server never sends rtsps
+                // to a 3.0.1 player, which would open it as plain RTSP.
+                "playback.rtsps",
+                // A fisheye camera shown as a normal 16:9 view, steered by camera_view and touch
+                // (player/FisheyeGlView.kt). Full-screen items; zones show the circle as it comes.
+                "playback.fisheye",
+                // The ONVIF relay (net/OnvifRelay.kt): this screen probes and talks to cameras on its own
+                // LAN for the server, private addresses only. Needs nothing beyond INTERNET.
+                "onvif.bridge",
                 "playback.zones", "playback.transitions", "playback.pip",
                 // 3.0 campaigns: a playlist whose items are whole layouts (player/CampaignPlayer.kt).
                 // In no server baseline: an older APK gets the plain fallback list instead.
@@ -117,6 +127,10 @@ object PlayerCapabilities {
                 // (remote/ScreenShareReceiver + ScreenShareOverlay). The same bundled libwebrtc as
                 // Talk, receive-only (no permission at all), so it holds on every panel this APK runs on.
                 "remote.screen_share",
+                // ...and several presenters at once: up to 4 tiled (2x2), one spotlighted full screen
+                // with the others connected but hidden, and only one presenter's sound playing. Without
+                // this the server never sends a second session to this screen.
+                "remote.screen_share_tiles",
                 // #312 follow-up: accept a server-URL rewrite from the dashboard, VERIFYING the new
                 // address is reachable before committing and rolling back if not (see
                 // WebSocketService's set_server_url handler). Declared because we do that
@@ -192,6 +206,10 @@ object PlayerCapabilities {
              * falling back to a baseline that omits it) being sent something it would drop.
              */
             caps += "net.http_request"
+
+            // #720: the Wi-Fi networks listed on the device page. HOW (owner / direct / suggestions) is
+            // device_info.wifi_mode; the capability only says the player can manage them at all.
+            if (com.remotedisplay.player.net.WifiNetworkManager.modeFor(context) != com.remotedisplay.player.net.WifiModeLogic.UNSUPPORTED) caps += "net.wifi"
 
             // Owner-only reboot. Off-owner it degrades to an accessibility power DIALOG, which needs
             // someone standing at the screen — not a remote capability.

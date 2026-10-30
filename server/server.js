@@ -21,6 +21,7 @@ if (process.env.SITE_CACHE_FOR) {
  * precisely when something else has already gone wrong. Repairing takes seconds; diagnosing at 2am
  * does not. ST_SKIP_DEP_PREFLIGHT=1 turns it off.
  */
+const { accessLogger } = require('./lib/http-logging');
 require('./lib/preflight-deps').preflight();
 
 const express = require('express');
@@ -66,6 +67,8 @@ const app = express();
 // First, before anything can send a file: Express 5 refuses a dot-directory anywhere in an absolute
 // sendFile path, so an install under ~/.local (or any dot-dir) would 404 every page. See the module.
 app.use(require('./middleware/send-file-compat').sendFileCompat);
+// Camera passwords in rtsp(s) URLs reach only the screen that opens the stream. See the module.
+app.use(require('./middleware/mask-stream-credentials').maskStreamCredentialsMiddleware);
 const { trustedProxies } = require('./config/cloudflareIps');
 const { getClientIp } = require('./services/activity');
 // Trust loopback / link-local / unique-local (local dev, LAN reverse proxies)
@@ -73,6 +76,8 @@ const { getClientIp } = require('./services/activity');
 // the original client when fronted by Cloudflare; X-Forwarded-For from any
 // non-trusted source is ignored, so the value can't be spoofed.
 app.set('trust proxy', trustedProxies);
+// Before parsers, CORS, limiters and routes so their rejections are recorded too.
+if (config.accessLogEnabled) app.use(accessLogger({ getClientIp }));
 
 // Determine if SSL certs are available
 const hasSsl = fs.existsSync(config.sslCert) && fs.existsSync(config.sslKey);
@@ -153,7 +158,8 @@ const DASHBOARD_CSP = {
     // 'wss:'/'ws:' keep the dashboard's socket.io connection working; the CF entry lets the beacon report.
     connectSrc: ["'self'", 'wss:', 'ws:', 'https:', 'https://cloudflareinsights.com'],
     fontSrc: ["'self'", 'data:'],
-    frameSrc: ["'self'", 'https://www.youtube.com', 'https://youtube.com'],
+    // youtube-nocookie.com: the video embeds on the /guides/ pages (they get this policy too).
+    frameSrc: ["'self'", 'https://www.youtube.com', 'https://youtube.com', 'https://www.youtube-nocookie.com'],
     objectSrc: ["'none'"],
     baseUri: ["'self'"],
     formAction: ["'self'"],
@@ -703,6 +709,11 @@ app.get(['/integrations', '/integrations/'], (req, res) => {
   if (req.path === '/integrations') return res.redirect(301, '/integrations/');
   res.sendFile(path.join(config.frontendDir, 'integrations', 'index.html'));
 });
+// The guides hub: same shape. Without it /guides/ was a 404 and /guides redirected into it.
+app.get(['/guides', '/guides/'], (req, res) => {
+  if (req.path === '/guides') return res.redirect(301, '/guides/');
+  res.sendFile(path.join(config.frontendDir, 'guides', 'index.html'));
+});
 // The solutions hub (use cases: emergency alerts, meeting rooms, menu boards...) is served the same
 // way, for the same reason: static runs with index:false.
 app.get(['/solutions', '/solutions/'], (req, res) => {
@@ -721,9 +732,10 @@ app.use(express.static(config.frontendDir, { index: false, etag: true, lastModif
   } else if (/\.(png|jpg|jpeg|gif|svg|ico|woff2?|ttf|eot|webp|mp4|webm)$/i.test(filePath)) {
     res.setHeader('Cache-Control', 'public, max-age=2592000'); // 30 days
   }
-  // The Power BI client is loaded by the bi-dashboard widget page, which a player frames in a
-  // sandboxed (opaque-origin) iframe — helmet's same-origin CORP would block the script there.
-  if (filePath.includes(`${path.sep}vendor${path.sep}powerbi${path.sep}`)) res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  // The Power BI client and Leaflet are loaded by widget pages (bi-dashboard, radar) that a player
+  // frames in a sandboxed (opaque-origin) iframe — helmet's same-origin CORP would block them there.
+  if (filePath.includes(`${path.sep}vendor${path.sep}powerbi${path.sep}`)
+      || filePath.includes(`${path.sep}vendor${path.sep}leaflet${path.sep}`)) res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 }}));
 
 // Player HTML: dynamic route. Injects a small inline window.__playerConfig
@@ -743,6 +755,9 @@ const VIEWER_STORAGE_SHIM = ' (function(){try{var m={};var s={getItem:function(k
   + 'setItem:function(k,v){m[k]=String(v);},removeItem:function(k){delete m[k];},clear:function(){m={};},'
   + 'key:function(i){return Object.keys(m)[i]||null;}};Object.defineProperty(s,"length",{get:function(){return Object.keys(m).length;}});'
   + 'Object.defineProperty(window,"localStorage",{value:s,configurable:true});Object.defineProperty(window,"sessionStorage",{value:s,configurable:true});}catch(e){}})();';
+function escapeHtmlText(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 function sendPlayer(res, file, opts) {
   const playerHtmlPath = path.join(__dirname, 'player', file);
   fs.readFile(playerHtmlPath, 'utf8', (err, html) => {
@@ -750,9 +765,18 @@ function sendPlayer(res, file, opts) {
     // View-only viewers (routes/view.js) never report: there is no device to attribute it to.
     const viewer = opts && opts.viewer;
     const reportingEnabled = !viewer && String(process.env.PLAYER_DEBUG_REPORTING || 'on').toLowerCase() !== 'off';
+    // #674: the brand this hostname resolves to (custom domain, then the platform default). A screen
+    // that is not paired yet has no workspace, so this is what the setup screen shows; once paired,
+    // device:paired carries the workspace's own brand and the page switches to it.
+    let brand = { name: 'ScreenTinker', hidden: false };
+    try {
+      const { resolveBranding, playerBrand } = require('./lib/branding');
+      brand = playerBrand(resolveBranding(require('./db/database').db, { domain: ((res.req && res.req.hostname) || '').toString() }));
+    } catch (e) { /* branding is best-effort; the player matters more */ }
     const inject =
       '  <script>window.__playerConfig = window.__playerConfig || {}; ' +
       'window.__playerConfig.debugReporting = ' + JSON.stringify(reportingEnabled) + ';' +
+      ' window.__playerConfig.brand = ' + JSON.stringify(brand).replace(/</g, '\\u003c') + ';' +
       // `<` escaped so nothing in the object can close the script element.
       (viewer ? ' window.__playerConfig.viewer = ' + JSON.stringify(viewer).replace(/</g, '\\u003c') + ';' + VIEWER_STORAGE_SHIM : '') +
       '</script>\n';
@@ -779,17 +803,49 @@ function sendPlayer(res, file, opts) {
       console.warn('[player] ST_PLAYER_VERSION marker not found — page will report a stale client_version');
     }
     modified = stamped;
+    // #674: brand the markup itself, so the first paint is already right (the script re-applies it
+    // when a paired screen's workspace brand differs). Hidden = the heading is left empty.
+    const brandHtml = escapeHtmlText(brand.name);
+    modified = modified
+      .replace('<title>ScreenTinker Player</title>', '<title>' + (brand.name ? brandHtml + ' Player' : 'Player') + '</title>')
+      .replace('<h1 data-brand>ScreenTinker</h1>', '<h1 data-brand>' + brandHtml + '</h1>')
+      .replace('<h2 data-brand>ScreenTinker</h2>', '<h2 data-brand>' + brandHtml + '</h2>');
     // A viewer page carries its access token in the URL: never stored by a cache on the way.
     res.type('html').setHeader('Cache-Control', viewer ? 'no-store' : 'no-cache');
     res.send(modified);
   });
 }
 
+/*
+ * ⚠️ #715: THE webOS SHELL FRAMES THE PLAYER FROM ANOTHER ORIGIN.
+ *
+ * The LG webOS app (webos/js/app.js, playerUrl()) runs the web player in an iframe whose src is
+ * `/player?host=webos` — the shell is a packaged app, a different origin than the server, so helmet's
+ * X-Frame-Options: SAMEORIGIN makes webOS refuse the frame and show "connection to server is
+ * unstable", while the same /player opens fine in the panel's own browser. Same failure and same
+ * fix as the BrightSign player-host above and the bundle/widget render routes: drop the header and
+ * widen frame-ancestors. Gated on the `?host=webos` marker the shell sends (never for an ordinary
+ * /player), mirroring how the BrightSign case is scoped by context rather than opening the header up
+ * for everyone — a page framing the player from any other origin keeps SAMEORIGIN.
+ */
+function allowWebosFraming(req, res) {
+  if (String(req.query.host || '').toLowerCase() !== 'webos') return;
+  res.removeHeader('X-Frame-Options');
+  // The CSP is stripped from /player by the exempt middleware above, so this is usually a no-op;
+  // kept so the directive is relaxed rather than the policy dropped wherever a CSP does reach here.
+  const csp = res.getHeader('Content-Security-Policy');
+  if (typeof csp === 'string' && csp.includes('frame-ancestors')) {
+    res.setHeader('Content-Security-Policy', csp.replace(/frame-ancestors[^;]*/, 'frame-ancestors *'));
+  }
+}
+
 app.get(['/player', '/player/', '/player/index.html'], (req, res) => {
+  allowWebosFraming(req, res);
   sendPlayer(res, 'index.html');
 });
 
 app.get(['/player/legacy', '/player/legacy/', '/player/legacy/index.html', '/player/legacy.html'], (req, res) => {
+  allowWebosFraming(req, res);
   sendPlayer(res, 'legacy.html');
 });
 
@@ -1389,6 +1445,9 @@ function rateLimit(windowMs, maxRequests, onReject) {
 // Auth routes (public, rate limited)
 app.use('/api/auth/login', rateLimit(60000, 10)); // 10 attempts per minute
 app.use('/api/auth/register', rateLimit(60000, 5)); // 5 registrations per minute
+// Scale-out dial-out (lib/mesh/dial-out.js): the two unauthenticated invite routes. The invite is a
+// 50-bit single-use code, so this is hygiene rather than the defence; only mounted with MESH_ALLOW_UPLINK.
+if (config.meshAllowUplink) app.use('/api/mesh/invite', rateLimit(60000, 20));
 // Support-token redemption (lib/support-access) is unauthenticated by nature: the token IS the
 // credential. Guessing one means forging an Ed25519 signature, so this limiter is about noise,
 // not brute force — but it is the one auth surface a stranger can hit without an account, so it
@@ -1861,7 +1920,9 @@ app.get('/api/content/:id/bundle', async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     if (out.skipped.length) res.setHeader('X-Bundle-Skipped', String(out.skipped.length));
-    return res.send(out.html);
+    // #660: a playlist item marked "Transparent background" asks for the see-through page.
+    const bg = require('./lib/backgrounds');
+    return res.send(bg.wantsTransparent(req.query) ? bg.forceTransparent(out.html) : out.html);
   } catch (err) {
     if (err && err.status === 413) return res.status(413).json({ error: err.message });
     console.error('[bundle] inline failed for', req.params.id, err && err.message);
@@ -3186,7 +3247,7 @@ app.post('/api/provision/pair', requireAuth, resolveTenancy, checkDeviceLimit, (
   // (5 failures per IP per 15 min) plus the 5/min route limit, not by this TTL.
   const lastSeen = device.last_heartbeat || device.created_at;
   if (pairLockout.isCodeExpired(lastSeen)) {
-    return res.status(410).json({ error: 'Pairing code expired - restart the display to get a new code' });
+    return res.status(410).json({ error: pairLockout.CODE_EXPIRED_MESSAGE });
   }
   pairLockout.reset(ip); // a valid claim forgives prior failed attempts from this IP
 
@@ -3233,7 +3294,8 @@ app.post('/api/provision/pair', requireAuth, resolveTenancy, checkDeviceLimit, (
   require('./lib/device-group-rules').reconcileDeviceAsSystem(db, null, device.id);
 
   // Notify the device via WebSocket — or, scale-out C2, through the replica it is attached to.
-  const pairedMsg = { device_id: device.id, name: pairedName, settings_pin: settingsPin };
+  const pairedMsg = { device_id: device.id, name: pairedName, settings_pin: settingsPin,
+    brand: require('./lib/branding').playerBrandForDevice(require('./db/database').db, device.id) };   // #674
   const pairedRoom = deviceNs.adapter.rooms.get(device.id);
   if (pairedRoom && pairedRoom.size > 0) {
     deviceNs.to(device.id).emit('device:paired', pairedMsg);
@@ -3326,6 +3388,7 @@ app.get(['/download', '/download/'], (req, res) => {
   res.send(downloadIndex.renderPage({
     apk: apkCache.get(),
     ipk: ipkCache.get(),
+    ipkLocal: ipkCache.getLocal(),
     wgt: wgtCache.get(),
     brightsign: { exists: bsPackage.available(), version: bsPackage.version() },
     deb: debCache.get(),
@@ -3424,17 +3487,21 @@ app.get('/webos/version.json', (req, res) => {
   res.json(ipkCache.versionJson());
 });
 
-app.get('/webos/ScreenTinker.ipk', (req, res) => {
-  const ipk = ipkCache.get();
+function sendIpk(res, ipk, file) {
   if (!ipk.exists) return webosNotAvailable(res);
   res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Disposition', 'attachment; filename="ScreenTinker.ipk"');
+  res.setHeader('Content-Disposition', `attachment; filename="${file}"`);
   res.setHeader('Cache-Control', 'no-cache');
   res.sendFile(ipk.path);
-});
+}
+
+app.get('/webos/ScreenTinker.ipk', (req, res) => sendIpk(res, ipkCache.get(), ipkCache.FILE));
+// The same app under the id a panel in Local application launch mode installs (lib/ipk-cache.js).
+app.get('/webos/com.lg.app.signage.ipk', (req, res) => sendIpk(res, ipkCache.getLocal(), ipkCache.LOCAL_FILE));
 
 app.get(['/webos', '/webos/'], (req, res) => {
   const ipk = ipkCache.get();
+  const local = ipkCache.getLocal();
   const base = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send('<!DOCTYPE html><html><head><meta charset="utf-8"><title>ScreenTinker on LG webOS Signage</title>'
@@ -3444,10 +3511,16 @@ app.get(['/webos', '/webos/'], (req, res) => {
     + 'ol{padding-left:20px}li{margin:8px 0}.mut{color:#94a3b8;font-size:14px}.pill{display:inline-block;background:#1e293b;border-radius:20px;padding:4px 12px;font-size:13px;color:#94a3b8}a{color:#3b82f6}</style></head>'
     + '<body><div class="w"><h1>ScreenTinker \u2014 LG webOS Signage</h1>'
     + (ipk.exists ? `<p class="pill">Ready \u00b7 v${ipk.version} \u00b7 ${(ipk.size / 1024 / 1024).toFixed(2)} MB</p>` : '<p class="pill">No .ipk hosted yet</p>')
-    + `<p>Download <a href="${base}/webos/ScreenTinker.ipk">ScreenTinker.ipk</a> and install it on the panel:</p>`
+    + (local.exists
+      ? `<h2>USB, Local application mode</h2><p>Download <a href="${base}/webos/com.lg.app.signage.ipk">com.lg.app.signage.ipk</a>. Keep that file name: the panel installs nothing else.</p>`
+        + '<ol><li>On a FAT32 USB stick, make a folder named <code>application</code> at the root and put the file in it.</li>'
+        + '<li>On the panel, open <b>Server Settings</b>: set <b>Application Launch Mode</b> to <b>Local</b> and the application type to <b>IPK</b>, then run <b>Local Application Upgrade</b> from <b>USB</b>.</li>'
+        + '<li>Restart the panel when the upgrade finishes.</li></ol>'
+      : '')
+    + `<h2>${local.exists ? 'Other install routes' : 'Install'}</h2><p>Download <a href="${base}/webos/ScreenTinker.ipk">ScreenTinker.ipk</a> and install it on the panel:</p>`
     + '<ol><li><b>USB:</b> copy the file to a USB stick, plug it into the panel, open <b>Settings \u2192 General \u2192 Install App</b> (the exact path varies by webOS version), and pick it.</li>'
-    + '<li><b>SI server:</b> host the file and point the panel\u2019s SI Server setting at it.</li>'
-    + `<li>Launch ScreenTinker, enter <code>${base}</code>, and claim the pairing code in your dashboard.</li></ol>`
+    + '<li><b>SI server:</b> host the file and point the panel\u2019s SI Server setting at it.</li></ol>'
+    + `<p>Then launch ScreenTinker, enter <code>${base}</code>, and claim the pairing code in your dashboard.</p>`
     + `<p class="mut">The app checks <code>${base}/webos/version.json</code> and installs a newer build itself when the panel\u2019s SCAP library is present. Without it (or from a browser) the web player runs at <a href="${base}/player">${base}/player</a>.</p>`
     + '</div></body></html>');
 });
@@ -3486,6 +3559,18 @@ app.get(['/tizen', '/tizen/'], (req, res) => {
  */
 const CONTENT_PREFIXES = ['/guides/', '/integrations/', '/solutions/'];
 
+// "/guides/roku-digital-signage" -> "/guides/roku-digital-signage.html", for every page under those
+// prefixes. Built once from the directory listings, so a request path is only ever a map key.
+const EXTENSIONLESS_PAGES = new Map();
+for (const prefix of CONTENT_PREFIXES) {
+  try {
+    for (const f of fs.readdirSync(path.join(config.frontendDir, prefix))) {
+      const m = /^([a-z0-9-]+)\.html$/.exec(f);
+      if (m && m[1] !== 'index') EXTENSIONLESS_PAGES.set(prefix + m[1], prefix + f);
+    }
+  } catch (e) { /* a missing folder has no pages */ }
+}
+
 /*
  * ⚠️ A MISSING ASSET IS A 404, NEVER THE APP SHELL. Every app route is `/#/…`, so a path ending in a
  * file extension that reached the catch-all names a file we do not have. Answering it with
@@ -3509,7 +3594,7 @@ const NOT_FOUND_PAGE = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-
   + 'a:hover{text-decoration:underline}</style></head><body><div>'
   + '<h1>Page not found</h1>'
   + '<p>That page does not exist. Try the <a href="/">home page</a>, or the '
-  + '<a href="/guides/what-is-digital-signage.html">guides</a>.</p>'
+  + '<a href="/guides/">guides</a>.</p>'
   + '</div></body></html>';
 
 // SPA fallback for app routes. Unmatched /api/ paths return 404 so misrouted
@@ -3554,6 +3639,11 @@ app.get('/{*splat}', (req, res) => {
     return res.status(404).json({ error: 'Not found' });
   }
   if (CONTENT_PREFIXES.some((prefix) => req.path.startsWith(prefix))) {
+    // A page typed or linked without its .html (/guides/roku-digital-signage) is the page, not a miss.
+    // Only a plain lower-case slug is tried, so nothing outside these folders can be reached this way.
+    // Matched against the pages listed at boot, never by touching the disk with the request path.
+    const page = EXTENSIONLESS_PAGES.get(req.path);
+    if (page) return res.redirect(301, page);
     return res.status(404).type('html').send(NOT_FOUND_PAGE);
   }
   if (ASSET_EXTENSION.test(req.path)) {

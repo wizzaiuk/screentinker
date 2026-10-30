@@ -65,6 +65,7 @@ Item {
         if (cmd.loop !== undefined) s.setLoop(cmd.loop)
         if (cmd.pause !== undefined) s.pauseMedia(cmd.pause)
         if (cmd.js !== undefined) s.runJs(cmd.js)
+        if (cmd.fisheye !== undefined) s.setFisheye(cmd.fisheye)
     }
 
     function reveal(slot) {
@@ -92,12 +93,14 @@ Item {
         anchors.fill: parent
         volume: surface.volume
         forceMute: surface.forceMute
+        steeringPaused: stage.menuOpen
         onReady: { stage.slotEvent(surface.surfaceId, item ? item.token : "", "ready", ""); if (surface.isCurrent(item)) surface.reveal(slotA) }
         onEnded: stage.slotEvent(surface.surfaceId, item ? item.token : "", "ended", "")
         onYtLength: function(sec) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "yt_length", String(sec)) }
         onBundleSkip: function(detail) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "bundle_skip", detail) }
         onFailed: function(msg) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "failed", msg) }
         onPosition: function(p, d) { if (front) stage.slotPosition(surface.surfaceId, item ? item.token : "", p, d) }
+        onFisheyeTouch: function(detail) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "fisheye_touch", detail) }
     }
     Slot {
         id: slotB
@@ -105,12 +108,14 @@ Item {
         visible: false
         volume: surface.volume
         forceMute: surface.forceMute
+        steeringPaused: stage.menuOpen
         onReady: { stage.slotEvent(surface.surfaceId, item ? item.token : "", "ready", ""); if (surface.isCurrent(item)) surface.reveal(slotB) }
         onEnded: stage.slotEvent(surface.surfaceId, item ? item.token : "", "ended", "")
         onYtLength: function(sec) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "yt_length", String(sec)) }
         onBundleSkip: function(detail) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "bundle_skip", detail) }
         onFailed: function(msg) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "failed", msg) }
         onPosition: function(p, d) { if (front) stage.slotPosition(surface.surfaceId, item ? item.token : "", p, d) }
+        onFisheyeTouch: function(detail) { stage.slotEvent(surface.surfaceId, item ? item.token : "", "fisheye_touch", detail) }
     }
 
     TransitionRunner { id: transition; anchors.fill: parent; z: 2 }

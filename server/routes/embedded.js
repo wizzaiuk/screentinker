@@ -43,7 +43,7 @@ const { resolveTenancy }    = require('../lib/tenancy');
 const { resolveDevicePlaylist, resolvedLayoutId, resolveDeviceContext } = require('../lib/resolve-device-playlist');
 const { parseProfile, listPresets, getPreset, frameDimensions, frameOrientation } = require('../lib/embedded-profiles');
 const { cacheKey, toETag, isNotModified, get: cacheGet, set: cacheSet } = require('../lib/embedded-cache');
-const { render, renderLayout, isLayoutImageOnly, isBrowserAvailable, looksLikeImage } = require('../lib/embedded-render');
+const { render, renderLayout, isLayoutImageOnly, isBrowserAvailable, looksLikeImage, safeFitMode } = require('../lib/embedded-render');
 const { postprocess }       = require('../lib/embedded-postprocess');
 const pairLockout           = require('../lib/pair-lockout');
 const { sixDigitCode }      = require('../lib/numeric-code');
@@ -857,7 +857,11 @@ function resolveLayoutItems(deviceId, forceIndex, { advance = true } = {}) {
     expiresList.push(expiresIn);
 
     const dRev = dynamicRevFor(item, now);
-    dynamicRevParts.push(`z_${zone.id}_${item.content_id || item.widget_id || item.id || 'item'}_${dRev}`);
+    // Only a non-default fit goes into the key: zone.fit_mode is always set ('contain' by default),
+    // and keying on it would change every multi-zone panel's ETag on upgrade for nothing.
+    const zoneFit = safeFitMode(item.fit_mode || zone.fit_mode || 'contain');
+    const fitSuffix = zoneFit !== 'contain' ? `_${zoneFit}` : '';
+    dynamicRevParts.push(`z_${zone.id}_${item.content_id || item.widget_id || item.id || 'item'}${fitSuffix}_${dRev}`);
 
     zoneEntries.push({ zone, item, content: item });
   }
@@ -886,9 +890,31 @@ router.post('/pair/register', (req, res) => {
   const newToken = crypto.randomBytes(32).toString('hex');
   const claimSecret = crypto.randomBytes(32).toString('hex');
   const parsed = parseProfile(screen_profile || 'seeed-reterminal-sticky');
-  const width = parseInt(screen_width) || parsed?.width || 800;
-  const height = parseInt(screen_height) || parsed?.height || 480;
-  const profile = typeof screen_profile === 'object' ? JSON.stringify(screen_profile) : (screen_profile || 'seeed-reterminal-sticky');
+  let width = parseInt(screen_width) || parsed?.width || 800;
+  let height = parseInt(screen_height) || parsed?.height || 480;
+  let profile;
+  if (typeof screen_profile === 'object' && screen_profile !== null) {
+    profile = JSON.stringify(screen_profile);
+  } else if (typeof screen_profile === 'string' && getPreset(screen_profile)) {
+    const presetObj = getPreset(screen_profile);
+    if (
+      presetObj.parameterizedDimensions &&
+      ((screen_width && parseInt(screen_width) !== presetObj.width) || (screen_height && parseInt(screen_height) !== presetObj.height))
+    ) {
+      const candidate = { preset: screen_profile, width, height };
+      if (parseProfile(candidate)) {
+        profile = JSON.stringify(candidate);
+      } else {
+        width = presetObj.width;
+        height = presetObj.height;
+        profile = screen_profile;
+      }
+    } else {
+      profile = screen_profile;
+    }
+  } else {
+    profile = screen_profile || 'seeed-reterminal-sticky';
+  }
   // What the hardware said it is (screentinker_mcu registers with its compile-time preset). Only a
   // named preset the device itself sent; the Sticky default above is ours, not the device's.
   const reportedBoard = (typeof screen_profile === 'string' && getPreset(screen_profile)) ? (boardFrom(screen_profile) || null) : null;
@@ -1027,17 +1053,43 @@ function resolveOrientationRotation(req, device) {
  * request cannot be honoured by handing back nibbles. Refuse it rather than label nibbles as an image.
  */
 const IMAGE_FORMATS = new Set(['png', 'jpeg', 'jpg', 'bmp']);
-const PACKED_NIBBLE_DEPTHS = new Set(['spectra6', 'gray16']);
+const PACKED_CONTROLLER_DEPTHS = new Set(['spectra6', 'gray16', 'gray4']);
 function applyFormatOverride(req, profile) {
   if (!req.query.format) return null;
   const fmt = String(req.query.format).toLowerCase();
-  const known = fmt === 'png' || fmt === 'jpeg' || fmt === 'jpg' || fmt === 'bmp' || fmt === 'raw' || fmt === 'x-epd-packed' || fmt === 'x-epd-spectra6' || fmt === 'x-epd-gray16';
+  const known = fmt === 'png' || fmt === 'jpeg' || fmt === 'jpg' || fmt === 'bmp' || fmt === 'raw' || fmt === 'x-epd-packed' || fmt === 'x-epd-spectra6' || fmt === 'x-epd-gray16' || fmt === 'x-epd-gray4';
   if (!known) return null;
-  if (PACKED_NIBBLE_DEPTHS.has(profile.colorDepth) && IMAGE_FORMATS.has(fmt)) {
+  if (PACKED_CONTROLLER_DEPTHS.has(profile.colorDepth) && IMAGE_FORMATS.has(fmt)) {
     return `format=${fmt} is not available for ${profile.colorDepth} panels: the response is packed controller nibbles`;
   }
   profile.outputFormat = fmt;
   return null;
+}
+
+function deviceProfile(device, stated) {
+  let raw = device.screen_profile;
+  const w = parseInt(device.screen_width);
+  const h = parseInt(device.screen_height);
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === 'object' && parsed !== null) raw = parsed;
+    } catch (_) {}
+  }
+  if (typeof raw === 'object' && raw !== null && raw.preset) {
+    const preset = getPreset(raw.preset);
+    if (preset && preset.parameterizedDimensions && w > 0 && h > 0 && (!raw.width || !raw.height)) {
+      if (w !== preset.width || h !== preset.height) {
+        raw = { ...raw, width: w, height: h };
+      }
+    }
+  } else if (typeof raw === 'string' && getPreset(raw)) {
+    const preset = getPreset(raw);
+    if (preset && preset.parameterizedDimensions && w > 0 && h > 0 && (w !== preset.width || h !== preset.height)) {
+      raw = { preset: raw, width: w, height: h };
+    }
+  }
+  return parseProfile(raw, stated);
 }
 
 // ─── GET /api/embedded/info ─────────────────────────────────────────────────────
@@ -1048,7 +1100,7 @@ router.get('/info', resolveAuth, (req, res) => {
 
   touchDeviceHeartbeat(device, req);
   const { orientation: overrideOrientation, rotation: overrideRotation } = resolveOrientationRotation(req, device);
-  const profile = parseProfile(device.screen_profile, { orientation: overrideOrientation, rotation: overrideRotation });
+  const profile = deviceProfile(device, { orientation: overrideOrientation, rotation: overrideRotation });
   const power = evaluateDevicePower(device);
   // /info is metadata (MCU negotiation / debugging / monitors). It must NOT advance the panel's
   // cursor, or a poll that lands after the current item's dwell would make the real render skip an item.
@@ -1097,7 +1149,7 @@ router.get('/render', resolveAuth, async (req, res) => {
   touchDeviceHeartbeat(device, req);
 
   const { orientation: overrideOrientation, rotation: overrideRotation } = resolveOrientationRotation(req, device);
-  const profile = parseProfile(device.screen_profile, { orientation: overrideOrientation, rotation: overrideRotation });
+  const profile = deviceProfile(device, { orientation: overrideOrientation, rotation: overrideRotation });
   if (!profile) {
     return res.status(400).json({
       error: 'Embedded rendering not configured for this device.',
@@ -1141,6 +1193,18 @@ router.get('/render', resolveAuth, async (req, res) => {
       return handleRenderLayout(req, res, device, profile, { ...renderOpts, explicitMode: false, preResolved: layoutResolved });
     }
 
+    if (layoutResolved && layoutResolved.zoneEntries.length === 1) {
+      const singleEntry = layoutResolved.zoneEntries[0];
+      // ⚠️ Not the zone's fit_mode: layout_zones.fit_mode is NOT NULL DEFAULT 'contain', so "inherited"
+      // and "never set" look the same, and every 1-zone layout in the field would switch from the
+      // cover it has always rendered with to contain (letterboxed, new ETag, fleet-wide redraw).
+      // A per-item fit_mode still applies.
+      return handleRenderStandard(req, res, device, profile, {
+        ...renderOpts,
+        zoneBackgroundColor: singleEntry.zone?.background_color,
+      });
+    }
+
     return handleRenderStandard(req, res, device, profile, renderOpts);
   });
 });
@@ -1154,7 +1218,7 @@ router.get('/render-layout', resolveAuth, async (req, res) => {
   touchDeviceHeartbeat(device, req);
 
   const { orientation: overrideOrientation, rotation: overrideRotation } = resolveOrientationRotation(req, device);
-  const profile = parseProfile(device.screen_profile, { orientation: overrideOrientation, rotation: overrideRotation });
+  const profile = deviceProfile(device, { orientation: overrideOrientation, rotation: overrideRotation });
   if (!profile) {
     return res.status(400).json({
       error: 'Embedded rendering not configured for this device.',
@@ -1177,6 +1241,84 @@ router.get('/render-layout', resolveAuth, async (req, res) => {
   return withCommandDropOnThrow(device.id, pendingCmdObj,
     () => handleRenderLayout(req, res, device, profile, { pendingCmd, pendingCmdObj, explicitMode: true }));
 });
+
+// ─── Refresh Mode Hinting State (Ticket S5) ──────────────────────────────────
+/*
+ * In-memory state tracking previous render frame per device for refresh mode hinting.
+ * Maps deviceId -> { itemIndex, contentId, layoutId, at }
+ *
+ * Note: this state is per-process. In a multi-instance deployment (PM2 cluster,
+ * multiple replicas) each worker hints independently — this fails safe: a worker
+ * that has not seen a device advises 'full' (never a missing 'full' where one was
+ * required), only redundant full refreshes can occur.
+ *
+ * Memory is bounded two ways:
+ *   - TTL: entries older than LAST_RENDERED_TTL_MS are evicted lazily on access;
+ *     a device that has been offline that long gets a full refresh anyway.
+ *   - Size cap: beyond LAST_RENDERED_MAX_ENTRIES the least-recently-recorded
+ *     entry is evicted (Map insertion order + delete/re-set gives LRU behavior).
+ */
+const _lastRendered = new Map();
+const LAST_RENDERED_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+const LAST_RENDERED_MAX_ENTRIES = 10000;
+
+function decideRefreshModeHeader(deviceId, profile, current) {
+  if (!profile.supportsPartialRefresh || profile.refreshMode === 'always_full') {
+    return 'full';
+  }
+  if (current && current.hasIfNoneMatch === false) {
+    return 'full';
+  }
+  const prev = _lastRendered.get(deviceId);
+  if (!prev) {
+    return 'full';
+  }
+  if (Date.now() - prev.at > LAST_RENDERED_TTL_MS) {
+    _lastRendered.delete(deviceId);
+    return 'full';
+  }
+  if (prev.layoutId !== current.layoutId) {
+    return 'full';
+  }
+  if (prev.itemIndex !== current.itemIndex || prev.contentId !== current.contentId) {
+    return 'full';
+  }
+  if (current.orientation !== undefined && prev.orientation !== undefined && prev.orientation !== current.orientation) {
+    return 'full';
+  }
+  if (current.colorDepth !== undefined && prev.colorDepth !== undefined && prev.colorDepth !== current.colorDepth) {
+    return 'full';
+  }
+  if (current.dither !== undefined && prev.dither !== undefined && prev.dither !== current.dither) {
+    return 'full';
+  }
+  if (current.fitMode !== undefined && prev.fitMode !== undefined && prev.fitMode !== current.fitMode) {
+    return 'full';
+  }
+  if (current.backgroundColor !== undefined && prev.backgroundColor !== undefined && prev.backgroundColor !== current.backgroundColor) {
+    return 'full';
+  }
+  return 'partial';
+}
+
+function recordRenderedFrame(deviceId, current) {
+  _lastRendered.delete(deviceId); // re-insert at tail: keeps Map order LRU-fresh
+  if (_lastRendered.size >= LAST_RENDERED_MAX_ENTRIES) {
+    const oldestKey = _lastRendered.keys().next().value;
+    _lastRendered.delete(oldestKey);
+  }
+  _lastRendered.set(deviceId, {
+    itemIndex: current.itemIndex,
+    contentId: current.contentId,
+    layoutId: current.layoutId,
+    orientation: current.orientation,
+    colorDepth: current.colorDepth,
+    dither: current.dither,
+    fitMode: current.fitMode || null,
+    backgroundColor: current.backgroundColor || null,
+    at: Date.now(),
+  });
+}
 
 async function handleRenderStandard(req, res, device, profile, opts = {}) {
   const ac = opts.signal ? null : new AbortController();
@@ -1205,6 +1347,8 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
       'X-ST-Device-Id': device.id,
       'X-ST-Expires-In': String(power.sleepSeconds),
       'X-ST-Power-State': 'scheduled_off',
+      'X-ST-Color-Mode': profile.colorDepth || '1bit',
+      'X-ST-Refresh-Mode': (profile.supportsPartialRefresh && profile.refreshMode !== 'always_full') ? 'partial' : 'full',
     };
     if (opts.pendingCmd) {
       offHeaders['X-ST-Command'] = opts.pendingCmd;
@@ -1226,7 +1370,7 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
   }
 
   const clientIp = touchDeviceHeartbeat(device, req);
-  const { item, content, itemIndex, total } = resolved;
+  let { item, content, itemIndex, total } = resolved;
   let expiresIn = resolved.expiresIn;
   if (power.isOff && power.sleepSeconds) {
     expiresIn = power.sleepSeconds;
@@ -1247,13 +1391,33 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
 
   // ── Cache check ─────────────────────────────────────────────────────────────
   const dynamicRev = dynamicRevFor(item, Math.floor(Date.now() / 1000));
+  const effectiveFitMode = (item && item.fit_mode)
+    ? safeFitMode(item.fit_mode, 'cover')
+    : (opts.zoneFitMode ? safeFitMode(opts.zoneFitMode, 'cover') : 'cover');
+  const fitSuffix = (item && item.fit_mode)
+    ? `_${safeFitMode(item.fit_mode, 'cover')}`
+    : (opts.zoneFitMode ? `_${safeFitMode(opts.zoneFitMode, 'cover')}` : '');
+  const effectiveBg = opts.zoneBackgroundColor || device?.background_color;
 
-  const key = cacheKey(
+  let key = cacheKey(
     device.id,
-    item.content_id || item.widget_id || item.id || 'item',
+    `${item.content_id || item.widget_id || item.id || 'item'}${fitSuffix}`,
     dynamicRev,
-    profile
+    profile,
+    { backgroundColor: effectiveBg }
   );
+
+  const currentRenderState = {
+    itemIndex,
+    contentId: content?.content_id || item?.content_id || item?.id || '',
+    layoutId: null,
+    orientation: frameOrientation(profile),
+    colorDepth: profile.colorDepth,
+    dither: profile.dither,
+    fitMode: effectiveFitMode,
+    backgroundColor: effectiveBg || null,
+    hasIfNoneMatch: isPreview ? undefined : Boolean(req.headers && req.headers['if-none-match']),
+  };
 
   // Common response headers
   const headers = {
@@ -1268,6 +1432,7 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
     'X-ST-Power-State': power.state,
     ...frameHeaders(profile),
   };
+  headers['X-ST-Refresh-Mode'] = decideRefreshModeHeader(device.id, profile, currentRenderState);
   if (profile.supportsPartialRefresh !== undefined) {
     headers['X-ST-Supports-Partial'] = profile.supportsPartialRefresh ? '1' : '0';
   }
@@ -1289,6 +1454,7 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
     const cached = cacheGet(key);
     if (cached.hit) {
       markCommandDelivered(device.id, opts);
+      recordRenderedFrame(device.id, currentRenderState);
       res.set({ ...headers, 'Content-Type': detectContentType(profile) });
       return res.status(200).send(cached.buffer);
     }
@@ -1302,7 +1468,12 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
 
   for (let attempt = 0; attempt < total; attempt++) {
     try {
-      renderResult = await render(renderItem, renderContent, profile, { signal });
+      renderResult = await render(renderItem, renderContent, profile, {
+        signal,
+        device,
+        backgroundColor: effectiveBg,
+        fitMode: effectiveFitMode,
+      });
       if (!renderResult.unsupported) break;
     } catch (e) {
       console.warn(`[embedded] item ${renderIndex} render error: ${e.message}`);
@@ -1326,10 +1497,43 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
     });
   }
 
+  // If the fallback loop advanced to another item, recompute key, headers and state before caching
+  if (renderIndex !== itemIndex) {
+    item = renderItem;
+    content = renderContent;
+    itemIndex = renderIndex;
+    const nextRev = dynamicRevFor(item, Math.floor(Date.now() / 1000));
+    const nextFitMode = (item && item.fit_mode)
+      ? safeFitMode(item.fit_mode, 'cover')
+      : (opts.zoneFitMode ? safeFitMode(opts.zoneFitMode, 'cover') : 'cover');
+    const nextFitSuffix = (item && item.fit_mode)
+      ? `_${safeFitMode(item.fit_mode, 'cover')}`
+      : (opts.zoneFitMode ? `_${safeFitMode(opts.zoneFitMode, 'cover')}` : '');
+    key = cacheKey(
+      device.id,
+      `${item.content_id || item.widget_id || item.id || 'item'}${nextFitSuffix}`,
+      nextRev,
+      profile,
+      { backgroundColor: effectiveBg }
+    );
+    headers['ETag'] = toETag(key);
+    headers['X-ST-Item-Index'] = String(itemIndex);
+    headers['X-ST-Content-Id'] = content?.content_id || item?.content_id || item?.id || '';
+    currentRenderState.itemIndex = itemIndex;
+    currentRenderState.contentId = content?.content_id || item?.content_id || item?.id || '';
+    currentRenderState.fitMode = nextFitMode;
+    headers['X-ST-Refresh-Mode'] = decideRefreshModeHeader(device.id, profile, currentRenderState);
+  }
+
   // ── Post-process ─────────────────────────────────────────────────────────────
   let processed;
   try {
-    processed = await postprocess(renderResult.png, profile);
+    const postProfile = {
+      ...profile,
+      fitMode: currentRenderState.fitMode,
+      backgroundColor: effectiveBg || '#000000',
+    };
+    processed = await postprocess(renderResult.png, postProfile);
   } catch (e) {
     console.error('[embedded] postprocess error:', e.message);
     // Same as every other answer here (and the layout path's 500): a frame we could not build is
@@ -1342,6 +1546,7 @@ async function handleRenderStandard(req, res, device, profile, opts = {}) {
   // Store in cache (non-blocking; non-fatal on failure)
   if (!isPreview) {
     try { cacheSet(key, processed.buffer); } catch { /* best-effort */ }
+    recordRenderedFrame(device.id, currentRenderState);
   }
 
   res.set({
@@ -1420,6 +1625,8 @@ async function handleRenderLayout(req, res, device, profile, opts = {}) {
       'X-ST-Device-Id': device.id,
       'X-ST-Expires-In': String(power.sleepSeconds),
       'X-ST-Power-State': 'scheduled_off',
+      'X-ST-Color-Mode': profile.colorDepth || '1bit',
+      'X-ST-Refresh-Mode': (profile.supportsPartialRefresh && profile.refreshMode !== 'always_full') ? 'partial' : 'full',
     };
     if (cmdOpts.pendingCmd) {
       offHeaders['X-ST-Command'] = cmdOpts.pendingCmd;
@@ -1454,8 +1661,21 @@ async function handleRenderLayout(req, res, device, profile, opts = {}) {
     device.id,
     'layout_' + layout.id,
     dynamicRev,
-    profile
+    profile,
+    { backgroundColor: device?.background_color }
   );
+
+  const currentRenderState = {
+    itemIndex: 0,
+    contentId: layout.id,
+    layoutId: layout.id,
+    orientation: frameOrientation(profile),
+    colorDepth: profile.colorDepth,
+    dither: profile.dither,
+    fitMode: null,
+    backgroundColor: device?.background_color || null,
+    hasIfNoneMatch: isPreview ? undefined : Boolean(req.headers && req.headers['if-none-match']),
+  };
 
   const headers = {
     'ETag': toETag(key),
@@ -1469,6 +1689,7 @@ async function handleRenderLayout(req, res, device, profile, opts = {}) {
     'X-ST-Power-State': power.state,
     ...frameHeaders(profile),
   };
+  headers['X-ST-Refresh-Mode'] = decideRefreshModeHeader(device.id, profile, currentRenderState);
   if (profile.supportsPartialRefresh !== undefined) {
     headers['X-ST-Supports-Partial'] = profile.supportsPartialRefresh ? '1' : '0';
   }
@@ -1487,6 +1708,7 @@ async function handleRenderLayout(req, res, device, profile, opts = {}) {
     const cached = cacheGet(key);
     if (cached.hit) {
       markCommandDelivered(device.id, cmdOpts);
+      recordRenderedFrame(device.id, currentRenderState);
       res.set({ ...headers, 'Content-Type': detectContentType(profile) });
       return res.status(200).send(cached.buffer);
     }
@@ -1535,6 +1757,7 @@ async function handleRenderLayout(req, res, device, profile, opts = {}) {
 
   if (!isPreview) {
     try { cacheSet(key, processed.buffer); } catch { /* best-effort */ }
+    recordRenderedFrame(device.id, currentRenderState);
   }
 
   res.set({
@@ -1812,6 +2035,7 @@ function frameHeaders(profile) {
     'X-ST-Screen-Height': String(dims.height),
     'X-ST-Rotation': String(profile.rotation || 0),
     'X-ST-Orientation': frameOrientation(profile),
+    'X-ST-Color-Mode': profile.colorDepth || '1bit',
   };
 }
 
@@ -1822,6 +2046,7 @@ function detectContentType(profile) {
     case 'jpg':            return 'image/jpeg';
     case 'bmp':            return 'image/bmp';
     case 'x-epd-packed':
+    case 'x-epd-gray4':
     case 'x-epd-spectra6':
     case 'x-epd-gray16':
     case 'raw':
@@ -1844,5 +2069,11 @@ module.exports.normalizePresetName = normalizePresetName;
 module.exports.getFirmwareInfo = getFirmwareInfo;
 module.exports.otaBreaker = otaBreaker;
 module.exports.logListLimit = logListLimit;
+module.exports.decideRefreshModeHeader = decideRefreshModeHeader;
+module.exports.recordRenderedFrame = recordRenderedFrame;
+module.exports._lastRendered = _lastRendered;
+module.exports.LAST_RENDERED_TTL_MS = LAST_RENDERED_TTL_MS;
+module.exports.LAST_RENDERED_MAX_ENTRIES = LAST_RENDERED_MAX_ENTRIES;
+module.exports.applyFormatOverride = applyFormatOverride;
 
 

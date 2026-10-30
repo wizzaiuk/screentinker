@@ -51,6 +51,10 @@ function render(device, telemetry) {
     talkAvailable: true,
     latestTelemetry: telemetry || {},
     currentDither: 'floyd-steinberg',   // resolved in loadDevice() for embedded panels, outside the slice
+    currentPreset: 'seeed-reterminal-sticky',
+    currentColorDepth: '1bit',
+    currentRefreshMode: 'smart_partial',
+    colorModeBadgeHtml: () => '',
     diagWidget: null,
     // Stubs. Each returns something recognisable so a control cannot be "found" by accident.
     t: (key) => key,
@@ -92,6 +96,24 @@ function render(device, telemetry) {
     isEmbeddedDevice: (d) => !!d && (d.client_type === 'embedded' || String(d.platform || '').toLowerCase().includes('embedded')),
     isNativeDevice: (d) => !!d && (d.client_type === 'pi' || d.client_type === 'win' || d.client_type === 'mac'
       || /^(linux|windows|macos)\//.test(String(d.platform || '').toLowerCase())),
+    // Mirrors isWebDevice() in device-detail.js: the 'web' fallback of platformFamily() (the browser
+    // web player, LG webOS, iOS) — none of the families with an arm of their own. #731. Change the
+    // real helper and this together. The android_version short-circuit comes first: Android AND
+    // Tizen report a non-'Web/' android_version, so both are excluded before anything else.
+    isWebDevice: (d) => {
+      if (!d) return false;
+      const p = String(d.platform || '').toLowerCase();
+      if (d.client_type === 'apk') return false;
+      const av = String(d.android_version || '');
+      if (av !== '' && !av.startsWith('Web/')) return false;      // Android / Tizen OS strings
+      if (p.includes('brightsign') || p.includes('tizen') || d.client_type === 'wgt') return false;
+      if (d.client_type === 'roku' || /^roku($|\/)/.test(p)) return false;
+      if (d.client_type === 'pi' || d.client_type === 'win' || d.client_type === 'mac'
+        || /^(linux|windows|macos)\//.test(p)) return false;
+      if (d.client_type === 'embedded' || p.includes('embedded')) return false;
+      if (p.includes('vega')) return false;
+      return true;
+    },
     terminalPresets: (d) => {
       const p = String((d && d.platform) || '').toLowerCase();
       if (d && (d.client_type === 'win' || p.startsWith('windows/'))) return [{ label: 'Helper service', cmd: 'Get-Service ScreenTinkerHelper' }];
@@ -111,6 +133,9 @@ function render(device, telemetry) {
     // screen" + revert). It is not platform-dependent, so it is not this file's subject; it has
     // its own coverage in test/device-playlist-source-badge.test.js.
     playlistSourceBadge: () => '',
+    // The web player's offline-cache card: a status card, not a control, and covered by
+    // test/offline-cache-report.test.js.
+    offlineCacheCard: () => '',
     // Same again for the capture-tier notice ("this panel is only showing the player's own
     // window"). It explains a capture STATE the panel reported, not a control the platform is or
     // is not offered, so it is not this file's subject; it is covered in test/capture-mode.test.js.
@@ -568,6 +593,35 @@ test('the Android-only cards stay Android-only', () => {
   assert.ok(android.includes('device.info.settings_pin'), 'Android keeps its PIN card');
 });
 
+test('#731 the web player gets the PIN card it enforces, and so does webOS', () => {
+  // The browser web player loads /player/unpair-gate.js and refuses to unpair without the settings
+  // PIN ("Enter the settings PIN for this screen"), but the card that shows and rotates that PIN was
+  // gated to Android + native — so a web screen enforced a PIN nobody could see or reset (#731). The
+  // card now renders for the whole web family (browser, LG webOS).
+  for (const [name, dev] of [['web', WEB], ['webos', { platform: 'webos', android_version: 'Web/webOS' }]]) {
+    const html = render({ ...dev, settings_pin: '246813' });
+    assert.ok(html.includes('device.info.settings_pin') && html.includes('246813'),
+      `${name} must show the settings PIN it enforces`);
+    assert.ok(has(html, 'rotatePinBtn') && has(html, 'setPinBtn'),
+      `${name} must be able to rotate and set the PIN`);
+    // The Android OS version card stays Android-only: a web player has no android_version to show.
+    assert.ok(!html.includes('device.info.android_version'), `${name} shows no Android OS version card`);
+  }
+});
+
+test('#731 the new web PIN card does not leak onto a BrightSign, Roku or Tizen path change', () => {
+  // isWebDevice is the platformFamily 'web' FALLBACK: families with an arm of their own are carved
+  // out first and keep exactly their prior behaviour, so adding web touches none of them.
+  assert.ok(!render({ ...BRIGHTSIGN, settings_pin: '111111' }).includes('device.info.settings_pin'),
+    'BrightSign still shows no PIN card');
+  assert.ok(!render({ client_type: 'roku', platform: 'roku', settings_pin: '222222' }).includes('device.info.settings_pin'),
+    'Roku still shows no PIN card');
+  // Samsung Tizen already showed the PIN card (non-web android_version satisfies the Android arm);
+  // the web change must not disturb that — the "don't break Samsung" case.
+  assert.ok(render({ ...TIZEN, settings_pin: '333333' }).includes('device.info.settings_pin'),
+    'Tizen keeps the PIN card it already had');
+});
+
 // ---------------------------------------------------------------------------------------------
 // The native Raspberry Pi player (client_type 'pi', platform 'Linux/<distro> (<model>)').
 //
@@ -951,4 +1005,22 @@ test('a Roku is not offered the Triggers listener it does not implement', () => 
   roku.capabilities = capabilitiesFor({ ...roku, capabilities: null });
   assert.equal(has(render(roku), 'triggerConfigStub'), false);
   assert.ok(has(render(ANDROID_FULL), 'triggerConfigStub'), 'an Android panel keeps it');
+});
+
+test('#720 the Wi-Fi section is offered only to a player that declares net.wifi', () => {
+  const wifiPanel = { ...ANDROID_FULL, capabilities: [...ANDROID_FULL.capabilities, 'net.wifi'] };
+  assert.ok(has(render(wifiPanel), 'wifiHost'), 'a player that manages Wi-Fi gets the section');
+  assert.equal(has(render(ANDROID_FULL), 'wifiHost'), false, 'an Android panel without net.wifi does not');
+  assert.equal(has(render(WEB), 'wifiHost'), false, 'nor a browser tab');
+  // The ~440 undeclared panels resolve to their baseline, and net.wifi is in none.
+  const { capabilitiesFor } = require('../lib/player-capabilities');
+  const legacy = { client_type: 'apk', android_version: '9' };
+  legacy.capabilities = capabilitiesFor({ ...legacy, capabilities: null });
+  assert.equal(has(render(legacy), 'wifiHost'), false, 'a legacy panel is not offered a section its player cannot act on');
+});
+
+test('#720 net.wifi alone is enough for the Controls tab to appear', () => {
+  const html = render({ client_type: 'apk', android_version: '10', capabilities: ['playback.video', 'net.wifi'] });
+  assert.ok(html.includes('data-tab="controls"'), 'the tab is there');
+  assert.ok(has(html, 'wifiHost'), 'with the Wi-Fi section in it');
 });

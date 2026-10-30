@@ -13,6 +13,7 @@ import { frameDeviceOutput, displayAspectRatio } from '../lib/device-frame.js';
 import * as gettingStarted from '../components/getting-started.js';
 import { LiveViewer, whenVisible } from '../lib/webrtc-viewer.js';
 import { renderPowerScheduleEditor, readPowerScheduleEditor, presetWindows, problemMessage } from '../components/power-schedule-editor.js';
+import { mountWifiNetworks } from '../components/wifi-networks.js';
 import * as cui from '../components/corporate-ui.js';
 import { openDeviceMoveDialog } from '../components/device-move-dialog.js';
 import { setupViewAccess } from '../components/view-access-card.js';
@@ -205,6 +206,7 @@ let screenshotHandler = null;
 let playbackHandler = null;
 let logHandler = null;
 let shellHandler = null;
+let wifiDispose = null;   // #720 Wi-Fi section listener
 // Interactive terminal (system.pty): the live xterm.js instance, its session and its socket listeners,
 // kept at module scope so leaving the page (cleanup()) can close the session on the device.
 let ptyState = null;
@@ -442,6 +444,30 @@ function formatBytes(mb) {
   return `${mb} MB`;
 }
 
+/*
+ * The web player's offline-cache report (devices.offline_cache, ws/deviceSocket.js 'cache-status'):
+ * whether this screen would keep playing with its network gone. Amber when it would not.
+ */
+function offlineCacheCard(device) {
+  let r = null;
+  try { r = device && device.offline_cache ? JSON.parse(device.offline_cache) : null; } catch (e) { r = null; }
+  if (!r || !(r.wanted >= 0)) return '';
+  const size = (b) => (b >= 1073741824 ? `${(b / 1073741824).toFixed(1)} GB` : `${Math.max(0, Math.round((b || 0) / 1048576))} MB`);
+  const short = r.ready < r.wanted || !!r.error;
+  const lines = [];
+  if (r.partial > 0) lines.push(t('device.info.offline_cache_partial', { n: r.partial, size: size(r.partial_bytes) }));
+  if (r.quota > 0) lines.push(t('device.info.offline_cache_quota', { used: size(r.usage), quota: size(r.quota) }));
+  if (r.error) lines.push(t('device.info.offline_cache_error', { name: r.error }));
+  if (r.persisted === false) lines.push(t('device.info.offline_cache_not_persisted'));
+  const at = device.offline_cache_at ? new Date(device.offline_cache_at * 1000).toLocaleString() : '';
+  return `
+          <div class="info-card" title="${esc(at)}">
+            <div class="info-card-label">${t('device.info.offline_cache')} <span class="help-tip" data-tip="${t('device.info.offline_cache_tip')}">?</span></div>
+            <div class="info-card-value small" style="${short ? 'color:var(--warning)' : ''}">${esc(t('device.info.offline_cache_ready', { ready: r.ready, wanted: r.wanted, size: size(r.ready_bytes) }))}</div>
+            ${lines.map((l) => `<div style="font-size:11px;color:var(--text-muted);margin-top:2px">${esc(l)}</div>`).join('')}
+          </div>`;
+}
+
 function formatUptime(seconds) {
   if (!seconds) return '--';
   const d = Math.floor(seconds / 86400);
@@ -456,7 +482,9 @@ function formatUptime(seconds) {
 // server's receipt time; a gap > 2 min means the device clock is wrong, so per-item
 // schedules will fire at the wrong local time — surface it instead of a support mystery.
 function renderDeviceClock(device) {
-  const tz = device.reported_timezone || device.timezone || '--';
+  // 'UTC' in `timezone` is the column's default, not a choice (server lib/device-timezone.js treats
+  // it as unset), so a screen that has not reported its zone yet shows "--", not a made-up "UTC".
+  const tz = device.reported_timezone || (device.timezone && device.timezone !== 'UTC' ? device.timezone : null) || '--';
   if (!device.reported_utc || !device.reported_at) return tz;
   const skewSec = Math.abs(Math.round(device.reported_utc / 1000) - device.reported_at);
   let local = '';
@@ -600,6 +628,27 @@ function isNativeDevice(device) {
 function isEmbeddedDevice(device) {
   if (!device) return false;
   return device.client_type === 'embedded' || String(device.platform || '').toLowerCase().includes('embedded');
+}
+
+// Mirrors the 'web' fallback of platformFamily() (and 'ios', the same web player in a WKWebView):
+// the browser web player, the LG webOS panel and the iOS app all load /player and its
+// /player/unpair-gate.js, so they REFUSE to unpair without the settings PIN ("Enter the settings PIN
+// for this screen"). Every family with an arm of its own (Android, the native Pi/Windows/Mac
+// players, BrightSign, Samsung Tizen, Roku, embedded, Vega) is carved out ahead of the fallback and
+// keeps its current behaviour — this only names the families that were left with NO PIN card at all
+// in the dashboard even though the player enforces one (issue #731). webOS has no arm of its own in
+// platformFamily() (it registers platform 'webos'), so it lands here, which is correct.
+function isWebDevice(device) {
+  if (!device) return false;
+  if (isAndroidDevice(device)) return false;      // client_type 'apk', or a non-web android_version (Tizen too)
+  if (isNativeDevice(device)) return false;        // Pi / Windows / Mac
+  if (isBrightSignDevice(device)) return false;
+  if (isRokuDevice(device)) return false;
+  if (isEmbeddedDevice(device)) return false;
+  const platform = String(device.platform || '').toLowerCase();
+  if (platform.includes('tizen') || device.client_type === 'wgt') return false;
+  if (platform.includes('vega')) return false;
+  return true;
 }
 
 // The one-shot shell's presets and wording, per native OS. Android keeps TERMINAL_PRESETS.
@@ -810,21 +859,71 @@ async function loadDevice(deviceId, activeTab = null) {
     const latestTelemetry = device.telemetry?.[0] || {};
     const diagWidget = (device.assignments || []).find(a => a && a.widget_type === 'diag-smoothness');
 
+    const { currentPreset, currentColorDepth, currentRefreshMode } = (() => {
+      let preset = 'seeed-reterminal-sticky';
+      let depth = '1bit';
+      let refreshMode = 'smart_partial';
+      if (device.screen_profile) {
+        if (typeof device.screen_profile === 'object') {
+          if (device.screen_profile.preset) preset = device.screen_profile.preset;
+          if (device.screen_profile.colorDepth) depth = device.screen_profile.colorDepth;
+          if (device.screen_profile.refreshMode) refreshMode = device.screen_profile.refreshMode;
+        } else if (typeof device.screen_profile === 'string') {
+          if (device.screen_profile.startsWith('{')) {
+            try {
+              const p = JSON.parse(device.screen_profile);
+              if (p && p.preset) preset = p.preset;
+              if (p && p.colorDepth) depth = p.colorDepth;
+              if (p && p.refreshMode) refreshMode = p.refreshMode;
+            } catch (_) {}
+          } else {
+            preset = device.screen_profile;
+          }
+        }
+      }
+      if (depth === 'rgb888') depth = '24bit-rgb888';
+      if (depth === 'mono') depth = '1bit';
+      if (depth === '1bit') {
+        if (preset.includes('e1002') || preset.includes('e1004')) depth = 'spectra6';
+        else if (preset.includes('e1003')) depth = 'gray16';
+        else if (preset.includes('seeed-xiao-led') || preset.includes('rgb888') || preset.includes('xiao_led')) depth = '24bit-rgb888';
+      }
+      return { currentPreset: preset, currentColorDepth: depth, currentRefreshMode: refreshMode };
+    })();
+
     const currentDither = (() => {
-      if (!device.screen_profile) return 'floyd-steinberg';
-      if (typeof device.screen_profile === 'object') return device.screen_profile.dither || 'floyd-steinberg';
+      if (!device.screen_profile) return currentColorDepth === '24bit-rgb888' ? 'none' : 'floyd-steinberg';
+      if (typeof device.screen_profile === 'object') return device.screen_profile.dither || (currentColorDepth === '24bit-rgb888' ? 'none' : 'floyd-steinberg');
       try {
         const p = JSON.parse(device.screen_profile);
         if (p && p.dither) return p.dither;
       } catch (_) {}
-      return 'floyd-steinberg';
+      return currentColorDepth === '24bit-rgb888' ? 'none' : 'floyd-steinberg';
     })();
+
+    const colorModeBadgeHtml = () => {
+      if (!isEmbeddedDevice(device)) return '';
+      if (currentColorDepth === 'gray4') {
+        return `<span class="device-status-badge" style="background:#2563eb;color:#fff" title="${t('device.color_mode.gray4_tip')}">${t('device.color_mode.gray4_badge')}</span>`;
+      }
+      if (currentColorDepth === 'gray16') {
+        return `<span class="device-status-badge" style="background:#4f46e5;color:#fff" title="${t('device.color_mode.gray16_tip')}">${t('device.color_mode.gray16_badge')}</span>`;
+      }
+      if (currentColorDepth === 'spectra6') {
+        return `<span class="device-status-badge" style="background:linear-gradient(90deg,#ef4444,#f59e0b,#10b981,#3b82f6,#8b5cf6);color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.6)" title="${t('device.color_mode.spectra6_tip')}">${t('device.color_mode.spectra6_badge')}</span>`;
+      }
+      if (currentColorDepth === '24bit-rgb888' || currentColorDepth === 'rgb888') {
+        return `<span class="device-status-badge" style="background:#059669;color:#fff" title="${t('device.color_mode.24bit_tip')}">${t('device.color_mode.24bit_badge')}</span>`;
+      }
+      return `<span class="device-status-badge" style="background:#6b7280;color:#fff" title="${t('device.color_mode.1bit_tip')}">${t('device.color_mode.1bit_badge')}</span>`;
+    };
 
     contentEl.innerHTML = `
       <div class="device-header">
         <div class="device-header-left">
           <h1 id="deviceName">${esc(device.name)}</h1>
           ${(() => { const b = livenessBadge(device); return `<span class="device-status-badge ${b.state}"${b.title ? ` title="${esc(b.title)}"` : ''}>${esc(b.label)}</span>`; })()}
+          ${colorModeBadgeHtml()}
           ${device.owner_name || device.owner_email ? `<span style="font-size:12px;color:var(--text-muted)">${t('device.owner_label', { owner: esc(device.owner_name || device.owner_email) })}</span>` : ''}
         </div>
         <div class="device-header-actions">
@@ -890,7 +989,7 @@ async function loadDevice(deviceId, activeTab = null) {
         <div class="tab" data-tab="playlist">${t('device.tab.playlist')} <span class="help-tip" data-tip="${t('device.tab.playlist_tip')}">?</span></div>
         <div class="tab" data-tab="info">${t('device.tab.info')} <span class="help-tip" data-tip="${t('device.tab.info_tip')}">?</span></div>
         ${(can('remote.stream') || can('remote.input') || can('remote.screenshot')) ? `<div class="tab" data-tab="remote" data-advanced-ui>${t('device.tab.remote')} <span class="help-tip" data-tip="${t('device.tab.remote_tip')}">?</span></div>` : ''}
-        ${((can('audio.volume') || can('display.brightness') || can('system.brightness') || can('system.screen_timeout')) || isEmbeddedDevice(device)) ? `<div class="tab" data-tab="controls" data-advanced-ui>${t('device.tab.controls')} <span class="help-tip" data-tip="${t('device.tab.controls_tip')}">?</span></div>` : ''}
+        ${((can('audio.volume') || can('display.brightness') || can('system.brightness') || can('system.screen_timeout') || can('net.wifi')) || isEmbeddedDevice(device)) ? `<div class="tab" data-tab="controls" data-advanced-ui>${t('device.tab.controls')} <span class="help-tip" data-tip="${t('device.tab.controls_tip')}">?</span></div>` : ''}
         ${(device.tier === 2 || can('system.shell') || can('system.pty')) ? `<div class="tab" data-tab="terminal" data-advanced-ui>${t('device.tab.terminal')} <span class="help-tip" data-tip="${t('device.tab.terminal_tip')}">?</span></div>` : ''}
         <!--
           #313 — only for a display that actually HAS an enrolment key, i.e. one created for a
@@ -1148,6 +1247,7 @@ async function loadDevice(deviceId, activeTab = null) {
             <div class="info-card-label">${t('device.info.player_type')}</div>
             <div class="info-card-value small">${isEmbeddedDevice(device) ? (String(device.screen_profile || '').includes('seeed-reterminal-sticky') ? t('device.info.reterminal_sticky_player') : t('device.info.embedded_player')) : isBrightSignDevice(device) ? t('device.info.brightsign_player') : isLinuxDevice(device) ? t('device.info.linux_player') : isWindowsDevice(device) ? t('device.info.windows_player') : isRokuDevice(device) ? t('device.info.roku_player') : t('device.info.web_player')}</div>
           </div>
+          ${offlineCacheCard(device)}
           ${device.hardware_model ? `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.hardware_model')}</div>
@@ -1254,8 +1354,12 @@ async function loadDevice(deviceId, activeTab = null) {
           <!-- The Linux player sends android_version '' (it is not Android), so it never reaches the
                Android arm; its OS and model are on the hardware_os_version / hardware_model cards
                above. It DOES have an on-device settings menu behind the same PIN, so the PIN card
-               is rendered for it too. -->
-          ${(device.android_version && !device.android_version.startsWith('Web/')) || isNativeDevice(device) ? `
+               is rendered for it too. The web family (browser web player, LG webOS, iOS) is added by
+               isWebDevice: it reports android_version 'Web/...' so the Android arm skips it, yet it
+               ENFORCES the PIN at the Esc/back unpair gate (server/player/unpair-gate.js) — without
+               this it enforced a PIN the dashboard never showed or let you reset (#731). The nested
+               android_version card below stays Android-only, so a web player shows only the PIN. -->
+          ${(device.android_version && !device.android_version.startsWith('Web/')) || isNativeDevice(device) || isWebDevice(device) ? `
           ${device.android_version && !device.android_version.startsWith('Web/') ? `
           <div class="info-card">
             <div class="info-card-label">${t('device.info.android_version')}</div>
@@ -1369,12 +1473,37 @@ async function loadDevice(deviceId, activeTab = null) {
           <div style="display:flex;gap:12px;margin-bottom:12px">
             <div class="form-group" style="flex:1;margin:0">
               <label>${t('device.form.orientation_label')}</label>
+              ${(() => {
+                let effectiveOrientation = device.orientation || 'landscape';
+                if (isEmbeddedDevice(device)) {
+                  let pObj = null;
+                  try {
+                    if (typeof device.screen_profile === 'object' && device.screen_profile) {
+                      pObj = device.screen_profile;
+                    } else if (typeof device.screen_profile === 'string' && device.screen_profile.startsWith('{')) {
+                      pObj = JSON.parse(device.screen_profile);
+                    } else if (typeof device.screen_profile === 'string' && device.screen_profile) {
+                      pObj = { preset: device.screen_profile };
+                    }
+                  } catch (_) {}
+                  if (pObj && pObj.orientation) {
+                    effectiveOrientation = pObj.orientation;
+                  } else if (device.reported_orientation) {
+                    effectiveOrientation = device.reported_orientation;
+                  } else if (pObj && (pObj.preset === 'seeed-reterminal-e1004' || (pObj.width && pObj.height && pObj.height > pObj.width))) {
+                    effectiveOrientation = 'portrait';
+                  } else {
+                    effectiveOrientation = device.orientation || 'landscape';
+                  }
+                }
+                return `
               <select id="deviceOrientation" class="input" style="background:var(--bg-input)">
-                <option value="landscape" ${'landscape' === (device.orientation || 'landscape') ? 'selected' : ''}>${t('device.form.orientation.landscape')}</option>
-                <option value="portrait" ${'portrait' === device.orientation ? 'selected' : ''}>${t('device.form.orientation.portrait')}</option>
-                <option value="landscape-flipped" ${'landscape-flipped' === device.orientation ? 'selected' : ''}>${t('device.form.orientation.landscape_flipped')}</option>
-                <option value="portrait-flipped" ${'portrait-flipped' === device.orientation ? 'selected' : ''}>${t('device.form.orientation.portrait_flipped')}</option>
-              </select>
+                <option value="landscape" ${'landscape' === effectiveOrientation ? 'selected' : ''}>${t('device.form.orientation.landscape')}</option>
+                <option value="portrait" ${'portrait' === effectiveOrientation ? 'selected' : ''}>${t('device.form.orientation.portrait')}</option>
+                <option value="landscape-flipped" ${'landscape-flipped' === effectiveOrientation ? 'selected' : ''}>${t('device.form.orientation.landscape_flipped')}</option>
+                <option value="portrait-flipped" ${'portrait-flipped' === effectiveOrientation ? 'selected' : ''}>${t('device.form.orientation.portrait_flipped')}</option>
+              </select>`;
+              })()}
             </div>
               <div class="form-group">
                 <label>${t('device.form.background_label')}</label>
@@ -1392,6 +1521,27 @@ async function loadDevice(deviceId, activeTab = null) {
               </div>
             </div>
             ${isEmbeddedDevice(device) ? `
+            ${/* SYNC with server/lib/embedded-profiles.js: show only for presets whose supportedColorModes has more than one entry */''}
+            ${(currentPreset === 'seeed-reterminal-sticky' || currentPreset === 'seeed-reterminal-e1001') ? `
+            <div class="form-group">
+              <label>${t('device.form.color_mode_label')}</label>
+              <select id="epdColorMode" class="input" style="background:var(--bg-input)">
+                <option value="1bit" ${currentColorDepth === '1bit' ? 'selected' : ''}>${t('device.form.color_mode_1bit')}</option>
+                <option value="gray4" ${currentColorDepth === 'gray4' ? 'selected' : ''}>${t('device.form.color_mode_gray4')}</option>
+              </select>
+              <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('device.form.color_mode_hint')}</div>
+            </div>` : ''}
+            ${/* SYNC with server/lib/embedded-profiles.js: show only for presets with supportsPartialRefresh: true */''}
+            ${(currentPreset === 'seeed-reterminal-sticky' || currentPreset === 'seeed-reterminal-e1001' || currentPreset === 'seeed-reterminal-e1003') ? `
+            <div class="form-group">
+              <label>${t('device.form.refresh_mode_label')}</label>
+              <select id="epdRefreshMode" class="input" style="background:var(--bg-input)">
+                <option value="smart_partial" ${currentRefreshMode !== 'always_full' ? 'selected' : ''}>${t('device.form.refresh_mode_smart_partial')}</option>
+                <option value="always_full" ${currentRefreshMode === 'always_full' ? 'selected' : ''}>${t('device.form.refresh_mode_always_full')}</option>
+              </select>
+              <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('device.form.refresh_mode_hint')}</div>
+            </div>` : ''}
+            ${currentColorDepth !== '24bit-rgb888' ? `
             <div class="form-group">
               <label>${t('device.form.dither_label')}</label>
               <select id="epdDither" class="input" style="background:var(--bg-input)">
@@ -1400,7 +1550,7 @@ async function loadDevice(deviceId, activeTab = null) {
                 <option value="none" ${currentDither === 'none' ? 'selected' : ''}>${t('device.form.dither_none')}</option>
               </select>
               <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${t('device.form.dither_hint')}</div>
-            </div>
+            </div>` : ''}
             ` : ''}
             <div class="form-group">
             <label>${t('device.form.tags_label')}</label>
@@ -1440,6 +1590,13 @@ async function loadDevice(deviceId, activeTab = null) {
               <input type="checkbox" id="liveVideoToggle" ${device.live_video_enabled === 1 ? 'checked' : ''}> ${t('device.live_video.toggle')}
             </label>
             <div style="font-size:11px;color:var(--text-muted);margin:4px 0 0 24px">${t('device.live_video.hint')}</div>
+          </div>` : ''}
+          ${!isEmbeddedDevice(device) ? `
+          <div style="margin:12px 0">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+              <input type="checkbox" id="ignoreBatteryToggle" ${device.ignore_battery === 1 ? 'checked' : ''}> ${t('device.ignore_battery.toggle')}
+            </label>
+            <div style="font-size:11px;color:var(--text-muted);margin:4px 0 0 24px">${t('device.ignore_battery.hint')}</div>
           </div>` : ''}
           ${(!isEmbeddedDevice(device) || device.power_source === 'usb') ? `
           <div class="form-group" style="max-width:280px">
@@ -1623,7 +1780,7 @@ async function loadDevice(deviceId, activeTab = null) {
         </div>
       </div>` : ''}
 
-      ${((can('audio.volume') || can('display.brightness') || can('system.brightness') || can('system.screen_timeout')) || isEmbeddedDevice(device)) ? `
+      ${((can('audio.volume') || can('display.brightness') || can('system.brightness') || can('system.screen_timeout') || can('net.wifi')) || isEmbeddedDevice(device)) ? `
       <!-- Controls Tab (#160 Track-A system control — no device owner needed). ⚠️ ALSO for e-paper and
            other embedded panels, which have none of those controls but DO honour a device power
            schedule (the embedded renderer evaluates it and tells the panel how long to sleep). Without
@@ -1640,6 +1797,12 @@ async function loadDevice(deviceId, activeTab = null) {
           <h4 style="margin:0 0 8px">${t('power.section_title')}</h4>
           <div id="powerScheduleHost" style="font-size:13px;color:var(--text-muted)">…</div>
         </div>
+        ${can('net.wifi') ? `
+        <!-- #720 Wi-Fi networks this screen manages. Filled by mountWifiNetworks() (components/wifi-networks.js). -->
+        <div id="wifiSection" style="margin-bottom:22px">
+          <h4 style="margin:0 0 8px">${t('wifi.section_title')} <span class="help-tip" data-tip="${t('wifi.section_title_tip')}">?</span></h4>
+          <div id="wifiHost" style="font-size:13px;color:var(--text-muted)">…</div>
+        </div>` : ''}
         ${!isEmbeddedDevice(device) ? `<div style="font-size:11px;color:var(--text-muted);margin-bottom:12px">${t('device.sysctl.subtitle')}</div>` : ''}
         <div style="display:grid;grid-template-columns:130px 1fr;gap:14px 14px;align-items:center;font-size:13px;max-width:480px">
           ${can('audio.volume') ? `
@@ -2276,7 +2439,7 @@ function renderPlaylist(assignments) {
         <div class="playlist-item-name">${esc(a.filename || a.widget_name || t('common.unknown'))}</div>
         <div class="playlist-item-meta">
           ${a.child_playlist_id ? esc(tn('device.pl_item.playlist_with_count', a.child_item_count || 0)) : a.widget_id && !a.content_id ? t('device.pl_item.widget_with_type', { type: a.widget_type || 'custom' }) : a.mime_type === 'video/youtube' ? t('device.pl_item.youtube') : a.mime_type?.startsWith('video/') ? t('device.pl_item.video') : t('device.pl_item.image')}
-          ${a.zone_id ? ` &middot; <span style="color:var(--accent)">${t('device.pl_item.zone_label', { id: a.zone_id.slice(0,8) })}</span>` : ''}
+          ${a.zone_id ? ` &middot; <span class="pl-zone-label" data-zone-id="${esc(a.zone_id)}" style="color:var(--accent)">${t('device.pl_item.zone_label', { id: a.zone_id.slice(0,8) })}</span>` : ''}
           ${a.content_duration ? ` &middot; ${Math.floor(a.content_duration / 60)}:${String(Math.floor(a.content_duration % 60)).padStart(2, '0')}` : ''}
           ${!a.content_duration && !a.mime_type?.startsWith('video/') && a.duration_sec ? ` &middot; ${a.duration_sec}s` : ''}
           ${a.schedule_start ? ` &middot; ${a.schedule_start}-${a.schedule_end}` : ''}
@@ -2895,6 +3058,13 @@ function setupActions(device) {
   }
 
   wireLocationSearch();
+
+  const orientSelect = document.getElementById('deviceOrientation');
+  if (orientSelect && !orientSelect.dataset.wired) {
+    orientSelect.dataset.wired = '1';
+    orientSelect.addEventListener('change', () => { orientSelect.dataset.changed = '1'; });
+  }
+
   document.getElementById('saveSettingsTopBtn')?.addEventListener('click', () => {
     document.getElementById('saveNotesBtn')?.click();
   });
@@ -2921,23 +3091,44 @@ function setupActions(device) {
 
       let epdProfileUpdate = undefined;
       const ditherEl = document.getElementById('epdDither');
-      if (ditherEl) {
-        let existingPreset = 'seeed-reterminal-sticky';
+      const colorModeEl = document.getElementById('epdColorMode');
+      const refreshModeEl = document.getElementById('epdRefreshMode');
+      const orientationEl = document.getElementById('deviceOrientation');
+      const orientationChanged = orientationEl && orientationEl.dataset.changed === '1';
+      if (ditherEl || colorModeEl || refreshModeEl || (isEmbeddedDevice(device) && orientationEl)) {
+        let existingProfileObj = {};
         try {
           if (typeof device.screen_profile === 'string') {
             if (device.screen_profile.startsWith('{')) {
-              const p = JSON.parse(device.screen_profile);
-              if (p.preset) existingPreset = p.preset;
+              existingProfileObj = JSON.parse(device.screen_profile);
             } else if (device.screen_profile) {
-              existingPreset = device.screen_profile;
+              existingProfileObj = { preset: device.screen_profile };
             }
-          } else if (typeof device.screen_profile === 'object' && device.screen_profile?.preset) {
-            existingPreset = device.screen_profile.preset;
+          } else if (typeof device.screen_profile === 'object' && device.screen_profile) {
+            existingProfileObj = { ...device.screen_profile };
           }
         } catch (_) {}
+        const isParamPreset = existingProfileObj.preset === 'seeed-xiao-led';
+        if (isParamPreset && (!existingProfileObj.width || !existingProfileObj.height) && device.screen_width && device.screen_height) {
+          const w = parseInt(device.screen_width);
+          const h = parseInt(device.screen_height);
+          if (w > 0 && h > 0) {   // the preset's own default size included: writing it is harmless
+            existingProfileObj.width = w;
+            existingProfileObj.height = h;
+          }
+        }
+        const shouldWriteOrientation = orientationChanged || Boolean(existingProfileObj.orientation);
+        // ⚠️ No colorDepth/refreshMode/dither defaults here: this runs for EVERY embedded screen
+        // (anything with an orientation field), and a default would override the preset's own value
+        // whenever the stored profile does not name it, e.g. turn a generic RGB565 TFT into a 1-bit
+        // panel on an unrelated Save. Only what is stored and what the page shows is written.
         epdProfileUpdate = {
-          preset: existingPreset,
-          dither: ditherEl.value || 'floyd-steinberg',
+          preset: 'seeed-reterminal-sticky',
+          ...existingProfileObj,
+          ...(colorModeEl ? { colorDepth: colorModeEl.value } : {}),
+          ...(ditherEl ? { dither: ditherEl.value || 'floyd-steinberg' } : {}),
+          ...(refreshModeEl ? { refreshMode: refreshModeEl.value || 'smart_partial' } : {}),
+          ...(orientationEl && shouldWriteOrientation ? { orientation: orientationEl.value } : {}),
         };
       }
 
@@ -2945,7 +3136,9 @@ function setupActions(device) {
         ...locBody,
         tags: document.getElementById('deviceTags')?.value ?? undefined,
         notes: document.getElementById('deviceNotes').value,
-        orientation: document.getElementById('deviceOrientation').value,
+        orientation: isEmbeddedDevice(device)
+          ? (orientationChanged ? orientationEl?.value : undefined)
+          : document.getElementById('deviceOrientation')?.value,
         // #325: the reset button clears the field, which sends '' and the API stores NULL, putting
         // the screen back on the player's own default rather than pinning it to black.
         background_color: (document.getElementById('devBackground')?.dataset.cleared === '1')
@@ -2963,11 +3156,15 @@ function setupActions(device) {
         // a save never flips a flag the operator could not see.
         ...(document.getElementById('liveVideoToggle')
           ? { live_video_enabled: document.getElementById('liveVideoToggle').checked ? 1 : 0 } : {}),
+        // #724: "mains powered, ignore battery" override. Only sent when its control rendered.
+        ...(document.getElementById('ignoreBatteryToggle')
+          ? { ignore_battery: document.getElementById('ignoreBatteryToggle').checked ? 1 : 0 } : {}),
         ...(epdProfileUpdate !== undefined ? { screen_profile: epdProfileUpdate } : {}),
       });
       if (saved && saved.screen_profile !== undefined) {
         device.screen_profile = saved.screen_profile;
       }
+      if (orientationEl) delete orientationEl.dataset.changed;
       showToast(t('device.toast.settings_saved'), 'success');
       // A tag change can move the screen into or out of dynamic groups; say which.
       for (const c of (saved && saved.groups_changed) || []) {
@@ -3137,6 +3334,10 @@ function setupActions(device) {
     sendCommand(device.id, 'set_screen_timeout', { ms: parseInt(e.target.value, 10) }));
 
   wirePowerSchedule(device);
+  // #720: the screen's managed Wi-Fi list (only rendered when the player declares net.wifi).
+  const wifiHost = document.getElementById('wifiHost');
+  if (wifiDispose) { wifiDispose(); wifiDispose = null; }   // a reload of the page re-runs this
+  if (wifiHost) wifiDispose = mountWifiNetworks(wifiHost, device);
 
   const blockBtn = document.getElementById('blockDeviceBtn');
   blockBtn?.addEventListener('click', async () => {
@@ -3371,15 +3572,20 @@ function setupActions(device) {
     } catch (err) { showToast(err.message, 'error'); }
   });
 
-  document.getElementById('rotateTrigSecretBtn')?.addEventListener('click', async () => {
+  // Whether the screen has a secret yet: the first Generate has nothing to invalidate.
+  let trigSecretSet = !!device.trigger_secret;
+  const trigSecretBtn = document.getElementById('rotateTrigSecretBtn');
+  trigSecretBtn?.addEventListener('click', async () => {
     // ⚠️ Rotating invalidates whatever the integrator already typed into their control system, and
     // there is no way to un-rotate. Confirm rather than treating it as an ordinary button.
-    if (!confirm(t('device.trigcfg.rotate_confirm'))) return;
+    if (trigSecretSet && !confirm(t('device.trigcfg.rotate_confirm'))) return;
     try {
       const res = await api.setTriggerSecret(device.id, { rotate: true });
       if (res.secret) {
         const el = document.getElementById('trigSecretVal');
         if (el) el.textContent = res.secret;
+        trigSecretSet = true;
+        trigSecretBtn.textContent = t('device.trigcfg.rotate');
       }
       showToast(res.delivered ? t('device.trigcfg.saved_live') : t('device.trigcfg.saved_queued'),
         res.delivered ? 'success' : 'warning');
@@ -3636,8 +3842,9 @@ async function setupPlaylistActions(device) {
     const payload = (item, extras) => {
       const base = item.type === 'widget' ? { widget_id: item.id }
         : item.type === 'playlist' ? { child_playlist_id: item.id } : { content_id: item.id };
-      // A kiosk page is interactive: it stays up until skipped (duration 0 = live dwell).
-      if (item.kiosk) return { ...base, duration_sec: 0, zone_id: extras.zone_id };
+      // A kiosk page is interactive: it stays up until skipped (KIOSK_DWELL_SEC, content-picker.js),
+      // unless the operator typed a duration.
+      if (item.kiosk) return { ...base, duration_sec: extras.duration_sec ?? item.duration_sec, zone_id: extras.zone_id };
       return { ...base, ...extras };
     };
 
@@ -3714,6 +3921,18 @@ function layoutSourceNote(device) {
   return `<div id="layoutSourceNote" style="font-size:12px;color:var(--text-muted);margin-top:4px">${esc(t(key, { name: r.name || '' }))}</div>`;
 }
 
+/*
+ * The zone items without a zone play in: the one marked main, else the largest (the first of equal
+ * ones). Same rule as server/lib/playlist-layout.js mainZone and every player's orphan fallback.
+ */
+function mainZoneOf(zones) {
+  if (!Array.isArray(zones) || !zones.length) return null;
+  const marked = zones.find(z => Number(z.is_main) === 1);
+  if (marked) return marked;
+  const area = z => (Number(z.width_percent) || 0) * (Number(z.height_percent) || 0);
+  return zones.reduce((a, b) => (area(b) > area(a) ? b : a), zones[0]);
+}
+
 function attachRemoveHandlers(device) {
   // Populate zone selectors if device has a layout. The current zone_id for
   // each assignment is read from data-current-zone-id on the .zone-select
@@ -3738,9 +3957,18 @@ function attachRemoveHandlers(device) {
 
     const populateZoneSelects = (zones) => {
       const activeIds = new Set((zones || []).map(z => z.id));
+      // Name things the way the playlist editor does: the empty choice is "Main zone (<name>)"
+      // and an item's zone shows its name, not the first 8 characters of its id.
+      const main = mainZoneOf(zones);
+      const byId = new Map((zones || []).map(z => [z.id, z]));
+      document.querySelectorAll('.pl-zone-label').forEach(el => {
+        const z = byId.get(el.dataset.zoneId);
+        if (z) el.textContent = t('device.pl_item.zone_label', { id: z.name });
+      });
       document.querySelectorAll('.zone-select').forEach(select => {
         select.style.display = '';
         while (select.options.length > 1) select.remove(1); // keep the "no zone" placeholder, drop stale options
+        if (main) select.options[0].textContent = t('layoutpl.zone_main_auto', { name: main.name });
         const assignmentId = select.dataset.assignmentId;
         const currentZoneId = select.dataset.currentZoneId || '';
         (zones || []).forEach(z => {
@@ -3902,14 +4130,38 @@ function renderUptimeTimeline(uptimeData, statusLog = []) {
     }
   }
 
+  // Third pass: the offline periods, by the same rule as Recent incidents (offline row -> next
+  // online row, or now). The passes above leave a slot with the colour of its LAST event, so a
+  // drop and recovery inside one 15-minute slot was drawn all green and counted as 100% uptime,
+  // right above an incident that said "down 4m". Any downtime in a slot now marks it, and the
+  // percentage is time-weighted, not a count of slots.
+  const slotOfflineSec = new Array(slots).fill(0);
+  for (const p of offlinePeriods(statusLog, now)) {
+    const from = Math.max(p.start, dayAgo), to = Math.min(p.end, now);
+    if (to <= from) continue;
+    for (let s = Math.floor((from - dayAgo) / slotDuration); s < slots && dayAgo + s * slotDuration < to; s++) {
+      if (s < 0) continue;
+      const a = Math.max(from, dayAgo + s * slotDuration), b = Math.min(to, dayAgo + (s + 1) * slotDuration);
+      if (b <= a) continue;
+      slotOfflineSec[s] += b - a;
+      slotStatus[s] = 'offline';
+      slotReason[s] = { reason: p.reason, detail: p.detail };
+    }
+  }
+
   // Mark future slots as unknown
   const nowSlot = Math.floor((now - dayAgo) / slotDuration);
   for (let i = nowSlot + 1; i < slots; i++) slotStatus[i] = 'unknown';
 
-  // Calculate uptime percentage (only over known slots)
+  // Calculate uptime percentage (only over known slots, by time; the current slot counts up to now)
   const knownSlots = slotStatus.filter(s => s !== 'unknown').length;
-  const onlineSlots = slotStatus.filter(s => s === 'online').length;
-  const uptimePct = knownSlots > 0 ? Math.round((onlineSlots / knownSlots) * 100) : 0;
+  let knownSec = 0, offlineSec = 0;
+  for (let i = 0; i < slots; i++) {
+    if (slotStatus[i] === 'unknown') continue;
+    knownSec += Math.max(0, Math.min(slotDuration, now - (dayAgo + i * slotDuration)));
+    offlineSec += slotOfflineSec[i];
+  }
+  const uptimePct = knownSec > 0 ? Math.round((Math.max(0, knownSec - offlineSec) / knownSec) * 100) : 0;
   if (percentEl) {
     percentEl.textContent = knownSlots > 0
       ? t('device.timeline.uptime_pct_tracked', { pct: uptimePct, n: knownSlots * 15 })
@@ -3980,6 +4232,32 @@ function relTime(tsSec, nowSec = Math.floor(Date.now() / 1000)) {
   return d + 'd ago';
 }
 
+// Offline periods from the status log: one starts on each offline transition and closes at the
+// next 'online' row (or now, if it has not come back). Shared by the Uptime Timeline and Recent
+// incidents so the two can never disagree about when a screen was down.
+function offlinePeriods(statusLog, nowSec) {
+  const out = [];
+  const log = (statusLog || []).slice().sort((a, b) => a.timestamp - b.timestamp);
+  for (let i = 0; i < log.length; i++) {
+    const ev = log[i];
+    if (ev.status === 'online') continue;
+    // Collapse a repeated offline row (e.g. offline followed by offline_timeout).
+    if (i > 0 && log[i - 1].status !== 'online') continue;
+    let end = null;
+    for (let j = i + 1; j < log.length; j++) {
+      if (log[j].status === 'online') { end = log[j].timestamp; break; }
+    }
+    out.push({
+      start: ev.timestamp,
+      end: end != null ? end : nowSec,
+      ongoing: end == null,
+      reason: ev.reason || null,
+      detail: ev.detail || null,
+    });
+  }
+  return out;
+}
+
 // "Recent incidents" panel: a newest-first, time-sorted merge of typed device_events
 // (display sleep, crash, reboot, network, app_error) with offline→online periods
 // derived from the status log (so a device with only server-side offline data still
@@ -3991,25 +4269,15 @@ function renderIncidents(deviceEvents = [], statusLog = []) {
   const nowSec = Math.floor(Date.now() / 1000);
   const incidents = [];
 
-  // Offline periods from the status log (server-side ground truth). Start a period
-  // on each offline transition and close it at the next 'online' row.
-  const log = (statusLog || []).slice().sort((a, b) => a.timestamp - b.timestamp);
-  for (let i = 0; i < log.length; i++) {
-    const ev = log[i];
-    if (ev.status === 'online') continue;
-    // Collapse a repeated offline row (e.g. offline followed by offline_timeout).
-    if (i > 0 && log[i - 1].status !== 'online') continue;
-    let end = null;
-    for (let j = i + 1; j < log.length; j++) {
-      if (log[j].status === 'online') { end = log[j].timestamp; break; }
-    }
+  // Offline periods from the status log (server-side ground truth).
+  for (const p of offlinePeriods(statusLog, nowSec)) {
     incidents.push({
       type: 'offline',
-      reason: ev.reason || null,
-      detail: ev.detail || null,
-      timestamp: ev.timestamp,
-      durationSec: (end != null ? end : nowSec) - ev.timestamp,
-      ongoing: end == null,
+      reason: p.reason,
+      detail: p.detail,
+      timestamp: p.start,
+      durationSec: p.end - p.start,
+      ongoing: p.ongoing,
     });
   }
 
@@ -4155,6 +4423,7 @@ export function cleanup() {
   if (embeddedLogsHandler) off('embedded-logs', embeddedLogsHandler);
   embeddedLogsHandler = null;
   if (shellHandler) off('shell-result', shellHandler);   // #161 owner-tools listener
+  if (wifiDispose) { wifiDispose(); wifiDispose = null; }
   teardownPty(true);   // leaving the page ends the interactive terminal on the device too
   if (screenshotInterval) clearInterval(screenshotInterval);
   stopLiveTile();
